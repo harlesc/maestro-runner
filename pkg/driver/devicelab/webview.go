@@ -107,16 +107,23 @@ func (m *webViewManager) connectViaUnixSocket(cdpInfo *core.CDPInfo, cdpType str
 	client := cdp.New().Start(ws)
 
 	browser := rod.New().Client(client).NoDefaultDevice()
-	// Use a temporary timeout for Connect + Pages — the browser object itself is long-lived
-	browserTimeout := browser.Timeout(10 * time.Second)
-	if err := browserTimeout.Connect(); err != nil {
+	// Connect + Pages on the original browser, NOT a Timeout() clone.
+	// rod's Browser.Timeout()/Context() shallow-copy the struct, so Connect()
+	// (which initializes the event bus on its receiver) and Pages() (which
+	// caches pages whose context is derived from the receiver's) would leave
+	// their state behind on the temporary clone: the stored browser ends up
+	// without an event bus (nil pointer dereference in Browser.Event on the
+	// next page-cache miss), and every cached page dies when the clone's
+	// deadline fires. The WebSocket dial above is already time-bounded, so
+	// mirror what connectBrowserViaHTTP does.
+	if err := browser.Connect(); err != nil {
 		logger.Info("[cdp:6-browser] Rod browser connection failed: %v", err)
 		_ = m.forwarder.RemoveSocketForward(socketPath)
 		os.Remove(socketPath)
 		return fmt.Errorf("failed to connect Rod browser: %w", err)
 	}
 
-	pages, err := browserTimeout.Pages()
+	pages, err := browser.Pages()
 	if err != nil || len(pages) == 0 {
 		logger.Info("[cdp:6-browser] no pages found in WebView (err=%v)", err)
 		browser.Close()
