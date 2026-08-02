@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -43,17 +44,17 @@ func (m *mockDeviceLabClient) ScrollInArea(area uiautomator2.RectModel, directio
 func (m *mockDeviceLabClient) SwipeInArea(area uiautomator2.RectModel, direction string, percent float64, speed int) error {
 	return nil
 }
-func (m *mockDeviceLabClient) Back() error                       { return nil }
-func (m *mockDeviceLabClient) HideKeyboard() error               { return nil }
-func (m *mockDeviceLabClient) PressKeyCode(keyCode int) error    { return nil }
-func (m *mockDeviceLabClient) SendKeyActions(text string) error  { return nil }
+func (m *mockDeviceLabClient) Back() error                                   { return nil }
+func (m *mockDeviceLabClient) HideKeyboard() error                           { return nil }
+func (m *mockDeviceLabClient) PressKeyCode(keyCode int) error                { return nil }
+func (m *mockDeviceLabClient) SendKeyActions(text string) error              { return nil }
 func (m *mockDeviceLabClient) AddMedia(name, mime string, data []byte) error { return nil }
-func (m *mockDeviceLabClient) Screenshot() ([]byte, error)       { return nil, nil }
-func (m *mockDeviceLabClient) Source() (string, error)           { return m.sourceFunc() }
-func (m *mockDeviceLabClient) GetOrientation() (string, error)   { return "PORTRAIT", nil }
-func (m *mockDeviceLabClient) SetOrientation(string) error       { return nil }
-func (m *mockDeviceLabClient) GetClipboard() (string, error)     { return "", nil }
-func (m *mockDeviceLabClient) SetClipboard(string) error         { return nil }
+func (m *mockDeviceLabClient) Screenshot() ([]byte, error)                   { return nil, nil }
+func (m *mockDeviceLabClient) Source() (string, error)                       { return m.sourceFunc() }
+func (m *mockDeviceLabClient) GetOrientation() (string, error)               { return "PORTRAIT", nil }
+func (m *mockDeviceLabClient) SetOrientation(string) error                   { return nil }
+func (m *mockDeviceLabClient) GetClipboard() (string, error)                 { return "", nil }
+func (m *mockDeviceLabClient) SetClipboard(string) error                     { return nil }
 func (m *mockDeviceLabClient) GetDeviceInfo() (*uiautomator2.DeviceInfo, error) {
 	return &uiautomator2.DeviceInfo{RealDisplaySize: "1080x2400"}, nil
 }
@@ -62,8 +63,8 @@ func (m *mockDeviceLabClient) ForceStop(string) error                         { 
 func (m *mockDeviceLabClient) ClearAppData(string) error                      { return nil }
 func (m *mockDeviceLabClient) GrantPermissions(string, []string) error        { return nil }
 func (m *mockDeviceLabClient) SetAppiumSettings(map[string]interface{}) error { return nil }
-func (m *mockDeviceLabClient) WaitForSettle(int, int) (bool, error)          { return true, nil }
-func (m *mockDeviceLabClient) TreeHash() (uint64, error)                     { return 0, nil }
+func (m *mockDeviceLabClient) WaitForSettle(int, int) (bool, error)           { return true, nil }
+func (m *mockDeviceLabClient) TreeHash() (uint64, error)                      { return 0, nil }
 func (m *mockDeviceLabClient) FindFirstOf([]string) (*uiautomator2.Element, error) {
 	return nil, fmt.Errorf("not implemented in mock")
 }
@@ -134,7 +135,12 @@ func TestScrollUntilVisibleRespectsTimeout(t *testing.T) {
 	}
 }
 
-func TestScrollUntilVisibleDefaultMaxScrolls(t *testing.T) {
+// The failure message must report the ACTUAL number of scrolls attempted,
+// not a hardcoded cap (the old "after 20 scrolls" was printed even when
+// the deadline stopped the loop much earlier). Deliberately does not
+// touch scrollRetryDelay/scrollFindTimeoutMs: against the pre-patch
+// implementation this fails — its message always prints the cap.
+func TestScrollUntilVisibleErrorReportsActualScrollCount(t *testing.T) {
 	client := &mockDeviceLabClient{
 		sourceFunc: func() (string, error) {
 			return `<?xml version="1.0" encoding="UTF-8"?>
@@ -148,11 +154,12 @@ func TestScrollUntilVisibleDefaultMaxScrolls(t *testing.T) {
 
 	driver := New(client, &core.PlatformInfo{ScreenWidth: 1080, ScreenHeight: 2400}, nil)
 
+	// No explicit maxScrolls: the 3s deadline stops the loop after ~2
+	// scrolls. The old message would still print "after 20 scrolls".
 	step := &flow.ScrollUntilVisibleStep{
 		Element:   flow.Selector{Text: "NonExistent"},
 		Direction: "down",
-		BaseStep:  flow.BaseStep{TimeoutMs: 60000}, // long timeout
-		// MaxScrolls not set — defaults to 20
+		BaseStep:  flow.BaseStep{TimeoutMs: 3000},
 	}
 
 	result := driver.scrollUntilVisible(step)
@@ -160,8 +167,12 @@ func TestScrollUntilVisibleDefaultMaxScrolls(t *testing.T) {
 	if result.Success {
 		t.Error("Expected failure when element not found")
 	}
-	if client.scrollCalls != 20 {
-		t.Errorf("Expected default 20 scrolls, got %d", client.scrollCalls)
+	wantCount := fmt.Sprintf("after %d scrolls", client.scrollCalls)
+	if !strings.Contains(result.Message, wantCount) {
+		t.Errorf("Expected error message to contain %q, got %q", wantCount, result.Message)
+	}
+	if !strings.Contains(result.Message, "timeout 3000ms") {
+		t.Errorf("Expected error message to include the timeout, got %q", result.Message)
 	}
 }
 
@@ -262,4 +273,3 @@ func TestScrollUntilVisibleSkipsOffScreenMatches(t *testing.T) {
 		t.Errorf("Expected full %d scroll attempts (no short-circuit on off-screen match), got %d", 4, client.scrollCalls)
 	}
 }
-

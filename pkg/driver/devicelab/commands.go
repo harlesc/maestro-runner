@@ -927,6 +927,9 @@ func (d *Driver) scrollUntilVisible(step *flow.ScrollUntilVisibleStep) *core.Com
 		direction = "down"
 	}
 
+	// The historical default cap of 20 scrolls is retained here; patch
+	// 0005 makes it a driver-level policy (with an uncapped Maestro-parity
+	// mode). An explicitly set maxScrolls: always wins.
 	maxScrolls := 20
 	if step.MaxScrolls > 0 {
 		maxScrolls = step.MaxScrolls
@@ -954,14 +957,26 @@ func (d *Driver) scrollUntilVisible(step *flow.ScrollUntilVisibleStep) *core.Com
 	// button) and fall back to the plain visibility criterion.
 	centerRetries := 0
 
-	for i := 0; i < maxScrolls && time.Now().Before(deadline); i++ {
-		_, info, err := d.findElement(step.Element, true, 1000)
+	scrolls := 0
+	for i := 0; ; i++ {
+		if maxScrolls > 0 && i >= maxScrolls {
+			break
+		}
+		if !time.Now().Before(deadline) {
+			break
+		}
+		_, info, err := d.findElement(step.Element, true, scrollFindTimeoutMs)
 		if err == nil && info != nil {
 			// The DeviceLab agent returns matches from the full view hierarchy,
 			// including items below the fold in a ScrollView. Verify the element
 			// actually overlaps the viewport before declaring success — otherwise
 			// scrollUntilVisible can short-circuit on iteration 0 without ever
 			// moving the screen.
+			visibility := visiblePercentage(info.Bounds, width, height)
+			logger.Info("[devicelab] scrollUntilVisible iter=%d: found text=%q bounds=[%d,%d][%d,%d] visibility=%.2f centerRetries=%d",
+				i, info.Text, info.Bounds.X, info.Bounds.Y,
+				info.Bounds.X+info.Bounds.Width, info.Bounds.Y+info.Bounds.Height,
+				visibility, centerRetries)
 			if step.CenterElement {
 				// Defect: `centerElement: true` was parsed into
 				// ScrollUntilVisibleStep.CenterElement but never read anywhere
@@ -998,16 +1013,98 @@ func (d *Driver) scrollUntilVisible(step *flow.ScrollUntilVisibleStep) *core.Com
 			// Infrastructure failure (dead session, connection refused, etc.):
 			// surface immediately rather than silently looping through all scrolls.
 			return errorResult(err, "Failed to find element")
+		} else {
+			logger.Info("[devicelab] scrollUntilVisible iter=%d: not found (%v)", i, err)
 		}
 
-		if err := d.performScroll(direction, width, height, step.Engine, 0.3); err != nil {
+		if err := d.performScrollFromCenter(direction, width, height, step.Engine, step.Speed); err != nil {
 			return errorResult(err, fmt.Sprintf("Failed to scroll: %v", err))
 		}
+		scrolls++
 
-		time.Sleep(300 * time.Millisecond)
+		time.Sleep(scrollRetryDelay)
 	}
 
-	return errorResult(fmt.Errorf("element not found"), fmt.Sprintf("Element not found after %d scrolls", maxScrolls))
+	return errorResult(fmt.Errorf("element not found"),
+		fmt.Sprintf("Element not found after %d scrolls (timeout %dms)", scrolls, timeout.Milliseconds()))
+}
+
+// scrollRetryDelay is the pause between scrollUntilVisible iterations
+// (Maestro waits for the app to settle after each swipe; a fixed short
+// delay is the runner's existing approximation — the full settle-wait is
+// deliberately out of scope). scrollFindTimeoutMs bounds each per-
+// iteration element lookup. Vars so tests can shorten the loop.
+var (
+	scrollRetryDelay    = 300 * time.Millisecond
+	scrollFindTimeoutMs = 1000
+)
+
+// speedToDuration maps the step's speed (0-100) to a swipe duration in
+// milliseconds the way Maestro does (ScrollUntilVisibleCommand.
+// speedToDuration, v2.7.0): 1000*(100-speed)/100 + 1, so the default
+// speed 40 → 601ms. Unset (<=0) means Maestro's default of 40.
+func speedToDuration(speed int) int {
+	if speed <= 0 {
+		speed = 40
+	}
+	if speed > 100 {
+		speed = 100
+	}
+	return 1000*(100-speed)/100 + 1
+}
+
+// maestroSwipeEndpoints returns Maestro's swipeFromCenter endpoints
+// (AndroidDriver.swipe(elementPoint=centre, direction, durationMs),
+// v2.7.0): start at the EXACT screen centre, end 10% from the edge toward
+// the reveal direction (0.4 of the screen dimension). scrollUntilVisible
+// "down" reveals content below, i.e. a finger swipe UP toward 0.1H.
+//
+// Defect G: the previous gesture (0.3 of the dimension starting 0.15H
+// below centre) missed scrollable containers that occupy only the
+// screen's middle band — e.g. a modal dialog's ScrollView. The touch-DOWN
+// then landed below the scroller (on the dialog's button bar or the
+// dimmed background), the modal never scrolled, a target below the
+// modal's fold stayed pruned from the view hierarchy, and the step burned
+// its whole budget ("Element not found after 20 scrolls") while Maestro
+// CLI — whose centre-start swipe engages the modal's scroller — revealed
+// the element and passed. Measured on a synthetic modal (ScrollView
+// viewport y∈[672,1470] on a 2340-tall screen, target below its fold):
+// runner, every find missed (rc=1); Maestro CLI passed; engine-free
+// isolation: two raw swipes from (540,1521) left the content unmoved,
+// swipes from (540,1170) revealed the target.
+func maestroSwipeEndpoints(direction string, screenWidth, screenHeight int) (x1, y1, x2, y2 int) {
+	cx, cy := screenWidth/2, screenHeight/2
+	switch strings.ToLower(direction) {
+	case "down": // reveal below: finger swipe UP
+		return cx, cy, cx, screenHeight / 10
+	case "up": // reveal above: finger swipe DOWN
+		return cx, cy, cx, screenHeight * 9 / 10
+	case "left": // reveal left: finger swipe RIGHT
+		return cx, cy, screenWidth * 9 / 10, cy
+	case "right": // reveal right: finger swipe LEFT
+		return cx, cy, screenWidth / 10, cy
+	}
+	return cx, cy, cx, screenHeight / 10
+}
+
+// performScrollFromCenter dispatches scrollUntilVisible's per-iteration
+// gesture using Maestro's swipeFromCenter geometry (see
+// maestroSwipeEndpoints). Default ("" or "adb") uses adb input swipe;
+// "agent" uses the on-device agent's area scroll (unchanged semantics —
+// not covered by the defect-G measurements).
+func (d *Driver) performScrollFromCenter(direction string, width, height int, engine string, speed int) error {
+	useAgent := strings.EqualFold(engine, "agent")
+	if !useAgent {
+		if d.device != nil {
+			x1, y1, x2, y2 := maestroSwipeEndpoints(direction, width, height)
+			cmd := fmt.Sprintf("input swipe %d %d %d %d %d", x1, y1, x2, y2, speedToDuration(speed))
+			_, err := d.device.Shell(cmd)
+			return err
+		}
+		logger.Warn("scroll: ADB shell unavailable, falling back to agent gesture (may be unreliable on some Android skins)")
+	}
+	area := uiautomator2.NewRect(0, height/8, width, height*3/4)
+	return d.client.ScrollInArea(area, direction, 0.4, speedToDuration(speed))
 }
 
 // maxCenterRetries mirrors Maestro's maxRetryCenterCount (= 4) for the
