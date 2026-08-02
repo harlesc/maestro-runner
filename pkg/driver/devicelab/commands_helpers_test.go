@@ -963,19 +963,29 @@ func (h *hideKbClient) HideKeyboard() error {
 	return nil
 }
 
-func TestHideKeyboard_NoDevice_SucceedsImmediately(t *testing.T) {
-	// When d.device == nil, isKeyboardVisible() returns false on the first
-	// check (getKeyboardBounds returns nil without a shell), so
-	// hideKeyboard returns success after a single client call.
+func TestHideKeyboard_NoDevice_PressesBackOnceAndNeverUsesTheRPC(t *testing.T) {
+	// Without a device the keyboardShown() guard cannot run, so hideKeyboard falls through to its
+	// one-and-only attempt. Two properties are asserted, and both are the fix rather than
+	// bookkeeping:
+	//
+	//   - the Input.hideKeyboard RPC is NOT used. It is documented as "try KEYCODE_ESCAPE, fall
+	//     back to KEYCODE_BACK", i.e. it can spend two keys in one call, and a BACK with no
+	//     keyboard to swallow it NAVIGATES.
+	//   - exactly ONE back key is pressed. The retry loop this replaced could press a second BACK
+	//     after the first had already closed the keyboard, popping the screen — which presents
+	//     several steps later as a missing element that really does exist.
 	client := &hideKbClient{trackingClient: newTrackingClient()}
 	driver := New(client, &core.PlatformInfo{}, nil)
 
 	res := driver.hideKeyboard(&flow.HideKeyboardStep{})
 	if !res.Success {
-		t.Fatalf("hideKeyboard should succeed when keyboard is reported hidden: %v", res.Error)
+		t.Fatalf("hideKeyboard should succeed when the keyboard is reported hidden: %v", res.Error)
 	}
-	if client.hideCount != 1 {
-		t.Errorf("expected 1 HideKeyboard call (no retries), got %d", client.hideCount)
+	if client.hideCount != 0 {
+		t.Errorf("expected the HideKeyboard RPC to be unused, got %d call(s)", client.hideCount)
+	}
+	if len(client.pressKeyCodes) != 1 || client.pressKeyCodes[0] != uiautomator2.KeyCodeBack {
+		t.Errorf("expected exactly one KEYCODE_BACK, got %v", client.pressKeyCodes)
 	}
 }
 

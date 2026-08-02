@@ -777,22 +777,52 @@ func (d *Driver) eraseTextBrowser(chars int) *core.CommandResult {
 }
 
 func (d *Driver) hideKeyboard(_ *flow.HideKeyboardStep) *core.CommandResult {
-	// Retry up to 3 times — the on-device agent tries KEYCODE_ESCAPE first
-	// (keyboard-only, no navigation side-effects), then falls back to KEYCODE_BACK.
-	for attempt := 0; attempt < 3; attempt++ {
-		_ = d.client.HideKeyboard()
-
-		// Wait for keyboard to actually disappear (animation ~300ms).
-		deadline := time.Now().Add(500 * time.Millisecond)
-		for time.Now().Before(deadline) {
-			if !d.isKeyboardVisible() {
-				return successResult("Keyboard hidden", nil)
-			}
-			time.Sleep(100 * time.Millisecond)
-		}
+	// Nothing to hide — and this early return is load-bearing, not an optimisation. The agent
+	// falls back to KEYCODE_BACK, which NAVIGATES when there is no keyboard to swallow it, so an
+	// unconditional attempt walks the app back a screen and the next step fails looking for an
+	// element the driver has just left. See keyboardShown's incident note.
+	if d.device != nil && !d.keyboardShown() {
+		return successResult("Keyboard already hidden", nil)
 	}
 
-	return successResult("Hide keyboard (may not have been visible)", nil)
+	// EXACTLY ONE ATTEMPT. This used to retry up to 3 times, and the retry is what broke flows.
+	//
+	// The agent tries KEYCODE_ESCAPE and falls back to KEYCODE_BACK, so every attempt can cost a
+	// BACK — and a BACK with no keyboard to swallow it NAVIGATES. The visibility signal is not
+	// instantaneous (mInputShown lags the animation), so attempt 1 could close the keyboard, the
+	// 500ms poll could still read "visible", and attempt 2 then pressed BACK against a closed
+	// keyboard and popped the screen. Measured on sign-up-betstop-blocked, twice: hideKeyboard
+	// reported success in ~960ms and the app was back on the signup WELCOME screen, so the next
+	// step failed with "Element not found: signup-salutation-picker-text" — an element that existed,
+	// on a screen the driver had just left.
+	//
+	// The asymmetry decides it: a keyboard left open costs one obscured tap, which
+	// checkKeyboardBlocking already detects and reports honestly. A spurious BACK silently
+	// desynchronises the whole flow. So press once, verify generously, and if it is still up SAY SO
+	// rather than pressing again.
+	// ONE BACK, PRESSED HERE — not d.client.HideKeyboard().
+	//
+	// The agent's Input.hideKeyboard is documented as "try KEYCODE_ESCAPE, fall back to
+	// KEYCODE_BACK", and its own fallback decision is made with the same unreliable visibility
+	// signal this patch had to replace. Measured after the single-attempt change above: ONE
+	// hideKeyboard still left the app one screen back, which a lone BACK against an open keyboard
+	// cannot do — so the RPC is spending both keys in a single call.
+	//
+	// The Maestro CLI, which passes these flows, does exactly one thing here:
+	// `shell("input keyevent 4")` (AndroidDriver.hideKeyboard). Matching that is both the smaller
+	// behaviour and the proven one.
+	_ = d.client.PressKeyCode(uiautomator2.KeyCodeBack)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if !d.isKeyboardVisible() {
+			return successResult("Keyboard hidden", nil)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	return successResult("Hide keyboard requested (still reported visible; NOT retried — a second "+
+		"BACK would navigate)", nil)
 }
 
 func (d *Driver) inputRandom(step *flow.InputRandomStep) *core.CommandResult {

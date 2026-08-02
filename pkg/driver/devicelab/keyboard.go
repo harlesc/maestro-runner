@@ -105,6 +105,42 @@ func boundsFromMatches(matches []string) *core.Bounds {
 	}
 }
 
+// incident:keyboard-always-reads-as-visible — the visibility gate below queries
+// `dumpsys input_method`, NOT `dumpsys window InputMethod`.
+//
+// The original guard was `strings.Contains(output, "mInputShown=false")` against the output of
+// `dumpsys window InputMethod` — and that output does not contain the string `mInputShown` AT ALL.
+// Measured on emulator-5556, 2026-08-02: `dumpsys window InputMethod | grep -c mInputShown` is 0
+// both with the keyboard up and with it dismissed. So the guard never fired, parseKeyboardFrame
+// went on to parse the IME WINDOW's frame — which exists whether or not the keyboard is drawn —
+// and isKeyboardVisible answered `true` permanently.
+//
+// WHAT THAT COST: hideKeyboard retries up to 3 times, polling isKeyboardVisible for 500 ms after
+// each attempt, and the on-device agent falls back to KEYCODE_BACK. A gate stuck at "still
+// visible" therefore turned one hideKeyboard into up to three BACK presses, which NAVIGATE. On
+// sign-up-betstop-blocked that walked the app from signup page 1 back to the welcome screen, and
+// the next step failed with "Element not found: signup-salutation-picker-text" — a selector error
+// for an element that was on a screen the driver had left.
+//
+// It also poisoned tapWouldHitKeyboard/checkKeyboardBlocking, which could refuse a legitimate tap
+// with "keyboard is open — add a `- hideKeyboard` step".
+//
+// The reliable signal, measured the same way: `dumpsys input_method` reports mInputShown=true with
+// the keyboard up and mInputShown=false once dismissed. mIsInputViewShown is NOT usable — it read
+// `true` in both states.
+func (d *Driver) keyboardShown() bool {
+	if d.device == nil {
+		return false
+	}
+	output, err := d.device.Shell("dumpsys input_method")
+	if err != nil {
+		// Unknown rather than hidden: callers use this to decide whether to keep pressing
+		// BACK, and guessing "hidden" there is the harmless direction.
+		return false
+	}
+	return strings.Contains(output, "mInputShown=true")
+}
+
 // getKeyboardBounds returns the keyboard frame if visible, nil otherwise.
 // Requires device (ShellExecutor) to be available.
 func (d *Driver) getKeyboardBounds() *core.Bounds {
@@ -112,12 +148,12 @@ func (d *Driver) getKeyboardBounds() *core.Bounds {
 		return nil
 	}
 
-	output, err := d.device.Shell("dumpsys window InputMethod")
-	if err != nil {
+	if !d.keyboardShown() {
 		return nil
 	}
 
-	if strings.Contains(output, "mInputShown=false") {
+	output, err := d.device.Shell("dumpsys window InputMethod")
+	if err != nil {
 		return nil
 	}
 
