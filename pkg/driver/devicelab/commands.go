@@ -906,6 +906,13 @@ func (d *Driver) scrollUntilVisible(step *flow.ScrollUntilVisibleStep) *core.Com
 		return errorResult(err, "Failed to get screen size")
 	}
 
+	// centerRetries implements Maestro's retryCenterCount for centerElement:
+	// how many times we have seen the element sufficiently visible but not
+	// near the screen centre. Once it exceeds maxCenterRetries we give up
+	// centring (the content cannot scroll far enough — e.g. a bottom-pinned
+	// button) and fall back to the plain visibility criterion.
+	centerRetries := 0
+
 	for i := 0; i < maxScrolls && time.Now().Before(deadline); i++ {
 		_, info, err := d.findElement(step.Element, true, 1000)
 		if err == nil && info != nil {
@@ -914,7 +921,36 @@ func (d *Driver) scrollUntilVisible(step *flow.ScrollUntilVisibleStep) *core.Com
 			// actually overlaps the viewport before declaring success — otherwise
 			// scrollUntilVisible can short-circuit on iteration 0 without ever
 			// moving the screen.
-			if isElementOnScreen(info, width, height) {
+			if step.CenterElement {
+				// Defect: `centerElement: true` was parsed into
+				// ScrollUntilVisibleStep.CenterElement but never read anywhere
+				// (single grep hit), so the element was scrolled INTO VIEW but
+				// not TOWARD THE CENTRE. Measured on device (synthetic
+				// scrollable form, expanded section, 3-button nav): the runner
+				// stopped with the submit button's centre at y≈2274-2283 —
+				// inside the [2208,2340] system navigation window, which
+				// consumes the tap (3/3 probes; the subsequent tapOn pressed
+				// Home), while Maestro CLI 2.7.0 scrolled on until centre
+				// y≈1405 and the tap landed (3/3).
+				//
+				// Reference behaviour (Maestro Orchestra.scrollUntilVisible +
+				// UiElement.isElementNearScreenCenter/getVisiblePercentage,
+				// v2.7.0): with centerElement, once the element is >10%
+				// visible, success additionally requires its centre to be in
+				// the half of the screen toward which content is being
+				// revealed, plus a 1/5-of-screen margin; after 4 failed
+				// centring retries (content cannot scroll far enough) the
+				// plain visibilityPercentage criterion applies instead.
+				visibility := visiblePercentage(info.Bounds, width, height)
+				if visibility > 0.1 && centerRetries <= maxCenterRetries {
+					if isElementNearScreenCenter(info.Bounds, direction, width, height) {
+						return successResult(fmt.Sprintf("Element found after %d scrolls", i), info)
+					}
+					centerRetries++
+				} else if visibility >= visibilityNormalized(step.VisibilityPercentage) {
+					return successResult(fmt.Sprintf("Element found after %d scrolls", i), info)
+				}
+			} else if isElementOnScreen(info, width, height) {
 				return successResult(fmt.Sprintf("Element found after %d scrolls", i), info)
 			}
 		} else if err != nil && !isElementNotFoundError(err) {
@@ -931,6 +967,71 @@ func (d *Driver) scrollUntilVisible(step *flow.ScrollUntilVisibleStep) *core.Com
 	}
 
 	return errorResult(fmt.Errorf("element not found"), fmt.Sprintf("Element not found after %d scrolls", maxScrolls))
+}
+
+// maxCenterRetries mirrors Maestro's maxRetryCenterCount (= 4) for the
+// centerElement option of scrollUntilVisible: the number of times the
+// element may be seen sufficiently visible but off-centre before the plain
+// visibility criterion takes over (the list cannot scroll it to the centre).
+const maxCenterRetries = 4
+
+// visibilityNormalized converts the step's visibilityPercentage to
+// Maestro's visibilityPercentageNormalized. Unset (<= 0) means Maestro's
+// default DEFAULT_ELEMENT_VISIBILITY_PERCENTAGE = 100, i.e. fully visible.
+// Note: Maestro computes this with integer division ((vp / 100).toDouble(),
+// so any vp < 100 collapses to 0.0 and passes trivially); we use float
+// division, which is the evident intent of the option.
+func visibilityNormalized(visibilityPercentage int) float64 {
+	if visibilityPercentage <= 0 {
+		return 1.0
+	}
+	return float64(visibilityPercentage) / 100.0
+}
+
+// visiblePercentage is Maestro's UiElement.getVisiblePercentage: the
+// fraction of the element's area overlapping the screen, with the
+// full-screen overflow case short-circuited to 1.0.
+func visiblePercentage(b core.Bounds, screenWidth, screenHeight int) float64 {
+	if b.Width == 0 && b.Height == 0 {
+		return 0.0
+	}
+	if b.X <= 0 && b.Y <= 0 && b.X+b.Width >= screenWidth && b.Y+b.Height >= screenHeight {
+		return 1.0
+	}
+	visibleX := max(0, min(b.X+b.Width, screenWidth)-max(b.X, 0))
+	visibleY := max(0, min(b.Y+b.Height, screenHeight)-max(b.Y, 0))
+	total := b.Width * b.Height
+	if total <= 0 {
+		return 0.0
+	}
+	return float64(visibleX*visibleY) / float64(total)
+}
+
+// isElementNearScreenCenter is Maestro's UiElement.isElementNearScreenCenter
+// with the ScrollDirection→SwipeDirection mapping folded in (Maestro's
+// scrollUntilVisible "down" means "reveal content below", i.e. a finger
+// swipe UP). The element counts as near the centre when its centre lies in
+// the half of the screen toward which content is being revealed, plus a
+// margin of one fifth of the screen dimension:
+//
+//	"down"  (reveal below): centre Y < screenCentreY + screenH/5
+//	"up"    (reveal above): centre Y > screenCentreY - screenH/5
+//	"right" (reveal right): centre X < screenCentreX + screenW/5
+//	"left"  (reveal left):  centre X > screenCentreX - screenW/5
+func isElementNearScreenCenter(b core.Bounds, direction string, screenWidth, screenHeight int) bool {
+	cx := b.X + b.Width/2
+	cy := b.Y + b.Height/2
+	switch strings.ToLower(direction) {
+	case "down":
+		return cy < screenHeight/2+screenHeight/5
+	case "up":
+		return cy > screenHeight/2-screenHeight/5
+	case "right":
+		return cx < screenWidth/2+screenWidth/5
+	case "left":
+		return cx > screenWidth/2-screenWidth/5
+	}
+	return false
 }
 
 // performScroll dispatches a scroll gesture using the engine selected by the
