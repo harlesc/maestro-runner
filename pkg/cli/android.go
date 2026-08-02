@@ -290,6 +290,13 @@ func createUIAutomator2Driver(cfg *RunConfig, dev *device.AndroidDevice, info de
 	}
 	driver := uia2driver.New(client, platformInfo, dev)
 
+	// Honour --optional-find-timeout (see the devicelab path below for why). uiautomator2 carries the
+	// same hardcoded 7s OptionalFindTimeout, so it needs the same wiring or the flag is silently
+	// inert for whichever driver was missed.
+	if cfg.OptionalFindTimeout > 0 {
+		driver.SetOptionalFindTimeout(cfg.OptionalFindTimeout)
+	}
+
 	// Cleanup function (silent)
 	cleanup := func() {
 		if err := client.Close(); err != nil {
@@ -486,6 +493,12 @@ func createDeviceLabDriver(cfg *RunConfig, dev *device.AndroidDevice, info devic
 		AppVersion:   appVersion,
 	}
 	driver := devicelabdriver.New(adapter, platformInfo, dev)
+
+	// Honour --optional-find-timeout. The setter already existed but nothing called it outside
+	// tests, so the 7s OptionalFindTimeout constant was effectively hardcoded. 0 keeps that default.
+	if cfg.OptionalFindTimeout > 0 {
+		driver.SetOptionalFindTimeout(cfg.OptionalFindTimeout)
+	}
 
 	// Wire background CDP socket monitor (push events from Java driver, polls /proc/net/unix every 100ms)
 	cdpTracker := maestro.NewCDPTracker(wsClient)
