@@ -145,7 +145,7 @@ func (m *webViewManager) connectViaUnixSocket(cdpInfo *core.CDPInfo, cdpType str
 	if _, err := page.EvalOnNewDocument(webViewJSHelper); err != nil {
 		logger.Warn("[cdp:7-ready] failed to inject JS helper for future navigations: %v", err)
 	}
-	if _, err := page.Evaluate(rod.Eval(webViewJSHelper)); err != nil {
+	if _, err := page.Evaluate(evalHelperSource(webViewJSHelper)); err != nil {
 		logger.Info("[cdp:7-ready] failed to inject JS helper into current page: %v", err)
 	}
 
@@ -288,7 +288,7 @@ func (m *webViewManager) connectBrowserViaHTTP(cdpInfo *core.CDPInfo, cdpType st
 	if _, err := page.EvalOnNewDocument(browserJSHelper); err != nil {
 		logger.Warn("[cdp:8-ready] failed to inject browser JS for future navigations: %v", err)
 	}
-	if _, err := page.Evaluate(rod.Eval(browserJSHelper)); err != nil {
+	if _, err := page.Evaluate(evalHelperSource(browserJSHelper)); err != nil {
 		logger.Info("[cdp:8-ready] failed to inject browser JS into current page: %v", err)
 	}
 
@@ -464,7 +464,7 @@ func (m *webViewManager) refreshPage() error {
 
 	// Re-inject JS helper into the new page context
 	page := m.page.Timeout(cdpCallTimeout)
-	if _, err := page.Evaluate(rod.Eval(webViewJSHelper)); err != nil {
+	if _, err := page.Evaluate(evalHelperSource(webViewJSHelper)); err != nil {
 		logger.Debug("[webview] failed to inject JS helper after page refresh: %v", err)
 	}
 
