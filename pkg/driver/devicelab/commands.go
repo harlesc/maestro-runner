@@ -23,6 +23,22 @@ import (
 // Tap Commands
 // ============================================================================
 
+// tapOnStrategies orders locator strategies for a text/id tap: general
+// (matched-node) strategies first, clickable-only variants as fallback.
+// Order matters — the first strategy that matches decides WHERE the tap
+// lands. General strategies find the node bearing the text and the agent
+// clicks that node's centre (Maestro parity). The clickable-only fallback
+// preserves the ancestor-promotion escape hatch for trees where the text
+// is otherwise unreachable; it runs only when no general strategy matched.
+func tapOnStrategies(sel flow.Selector) ([]LocatorStrategy, error) {
+	allStrategies, err := buildSelectors(sel, 0)
+	if err != nil {
+		return nil, err
+	}
+	clickableStrategies, _ := buildClickableOnlyStrategies(sel)
+	return append(allStrategies, clickableStrategies...), nil
+}
+
 func (d *Driver) tapOn(step *flow.TapOnStep) *core.CommandResult {
 	// Check if using Point WITHOUT selector (screen-relative tap)
 	if step.Point != "" && step.Selector.IsEmpty() {
@@ -48,16 +64,41 @@ func (d *Driver) tapOn(step *flow.TapOnStep) *core.CommandResult {
 			return d.tapOnBrowser(step)
 		}
 
-		// Clickable-first: prefer buttons over labels. The agent promotes a text
-		// match to its nearest clickable ancestor when .clickable(true) is set,
-		// so "tapOn: SIGN IN" hits the clickable login-button ViewGroup even
-		// when the text lives on a non-clickable TextView child.
-		clickableStrategies, _ := buildClickableOnlyStrategies(step.Selector)
-		allStrategies, err := buildSelectors(step.Selector, 0)
+		// Matched-node strategies FIRST: the tap must land at the centre of
+		// the node that bears the text — Maestro taps
+		// (refreshedElement ?: element).bounds.center(), never a promoted
+		// ancestor. Clickable-only strategies stay as fallback: with
+		// .clickable(true) the agent PROMOTES a text match to its nearest
+		// clickable ancestor and clicks the ANCESTOR's centre, which can be
+		// a different, possibly covered, point.
+		//
+		// Defect (confirmed by measurement): menu row with a non-clickable
+		// label inside a clickable full-width row, plus a transparent
+		// touch-consuming overlay at the row's centre. Geometry replay (raw
+		// input tap): label centre (271,428) activates the row; row centre
+		// (540,428) is eaten by the overlay; off-centre (800,428) activates.
+		// Settled screen, single text tap (3/3 vs 3/3, logs): pre-fix the
+		// runner used textContains(X).clickable(true), promoted to the row
+		// [44,340][1036,517] and clicked its centre (540,428) → "overlay
+		// tapped" (PASS, row never activated); post-fix it finds the label
+		// [99,395][444,462] and clicks (271,428) → "row 2 activated".
+		// Maestro CLI 2.7.0 activates (5/5 across variants).
+		//
+		// Residual, NOT fixed here: with a screen transition in flight the
+		// agent's findAndClick can still click a stale mid-animation
+		// position (observed 2/3 post-fix runs clicking the label's
+		// mid-slide bounds; the pre-tap waitForAppToSettle /
+		// refreshElementUntilStable that Maestro does is a separate,
+		// larger piece of work).
+		//
+		// See 8358bf7 for why clickable-first was introduced (RN
+		// disambiguation); Maestro instead prefers clickable CANDIDATES
+		// bearing the text and still taps the matched node's centre, so a
+		// plain label tap works through ordinary touch dispatch.
+		strategies, err := tapOnStrategies(step.Selector)
 		if err != nil {
 			return errorResult(err, fmt.Sprintf("Failed to build selectors: %v", err))
 		}
-		strategies := append(clickableStrategies, allStrategies...)
 		timeout := d.calculateTimeout(step.IsOptional(), step.TimeoutMs)
 		ctx, cancel := context.WithTimeout(d.parentContext(), timeout)
 		defer cancel()
