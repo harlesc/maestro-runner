@@ -927,12 +927,9 @@ func (d *Driver) scrollUntilVisible(step *flow.ScrollUntilVisibleStep) *core.Com
 		direction = "down"
 	}
 
-	// The historical default cap of 20 scrolls is retained here; patch
-	// 0005 makes it a driver-level policy (with an uncapped Maestro-parity
-	// mode). An explicitly set maxScrolls: always wins.
-	maxScrolls := 20
-	if step.MaxScrolls > 0 {
-		maxScrolls = step.MaxScrolls
+	maxScrolls := step.MaxScrolls
+	if maxScrolls <= 0 {
+		maxScrolls = defaultScrollCap()
 	}
 	timeout := 30 * time.Second
 	if step.TimeoutMs > 0 {
@@ -1051,6 +1048,32 @@ func speedToDuration(speed int) int {
 		speed = 100
 	}
 	return 1000*(100-speed)/100 + 1
+}
+
+// defaultScrollCap returns the scroll-count cap for a scrollUntilVisible
+// step that does not set maxScrolls. Maestro has no count cap (its
+// do/while is bounded by the step timeout only,
+// Orchestra.scrollUntilVisible v2.7.0). The runner keeps its historical
+// default of 20 out of the box — a genuinely-absent element then fails
+// fast and attributable instead of scrolling until the timeout — while
+// allowing a driver-level override for Maestro parity:
+//
+//	MAESTRO_DEVICELAB_SCROLL_MAX_SCROLLS unset → 20
+//	MAESTRO_DEVICELAB_SCROLL_MAX_SCROLLS=0    → no cap (Maestro parity)
+//	MAESTRO_DEVICELAB_SCROLL_MAX_SCROLLS=N    → default cap N
+//
+// A per-step maxScrolls: always wins over this default.
+func defaultScrollCap() int {
+	v := strings.TrimSpace(os.Getenv("MAESTRO_DEVICELAB_SCROLL_MAX_SCROLLS"))
+	if v == "" {
+		return 20
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		logger.Warn("scrollUntilVisible: invalid MAESTRO_DEVICELAB_SCROLL_MAX_SCROLLS=%q, using 20", v)
+		return 20
+	}
+	return n
 }
 
 // maestroSwipeEndpoints returns Maestro's swipeFromCenter endpoints
