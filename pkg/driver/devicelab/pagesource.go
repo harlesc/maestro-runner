@@ -4,6 +4,7 @@ import (
 	"encoding/xml"
 	"fmt"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -315,9 +316,29 @@ func containsIgnoreCase(s, substr string) bool {
 	return strings.Contains(strings.ToLower(s), strings.ToLower(substr))
 }
 
-// Position filter functions
+// Position filter functions.
+//
+// Defect: relative selectors picked the wrong candidate (green step, wrong
+// element tapped). These filters used to SORT the survivors by 1-D distance
+// to the anchor (sortByDistance*); SelectByIndex then discarded even that
+// ordering by returning the globally deepest node. Measured on device
+// (synthetic app, two "Next Up" elements disambiguated by leftOf:"Today",
+// 4/4 paired runs): maestro-runner tapped the deep bottom-nav label while
+// Maestro CLI 2.7.0 tapped the on-row tab. A diagonal discriminator screen
+// (same-depth candidates: one in the anchor's row but far in X, one row
+// below but nearer in 2-D centre distance; 3/3 paired runs) showed Maestro
+// taps the candidate that comes FIRST in hierarchy order, NOT the nearest:
+// Maestro's Filters.relativeTo sort by distance is discarded by
+// Filters.intersect, which preserves the basic filter's order
+// (deepestMatchingElement over the pre-order aggregate), followed by a
+// stable clickableFirst and first-wins (Orchestra.buildFilter, v2.7.0).
+//
+// Reference behaviour (Maestro): relative filters are pure predicates and
+// MUST preserve the input (hierarchy) order of candidates. Do not re-add
+// distance sorting here.
 
 // FilterBelow returns elements below the anchor element.
+// Input order is preserved (see header above).
 func FilterBelow(elements []*ParsedElement, anchor *ParsedElement) []*ParsedElement {
 	anchorBottom := anchor.Bounds.Y + anchor.Bounds.Height
 	var result []*ParsedElement
@@ -329,12 +350,11 @@ func FilterBelow(elements []*ParsedElement, anchor *ParsedElement) []*ParsedElem
 		}
 	}
 
-	// Sort by distance (closest first)
-	sortByDistanceY(result, anchorBottom)
 	return result
 }
 
 // FilterAbove returns elements above the anchor element.
+// Input order is preserved (see header above).
 func FilterAbove(elements []*ParsedElement, anchor *ParsedElement) []*ParsedElement {
 	anchorTop := anchor.Bounds.Y
 	var result []*ParsedElement
@@ -347,12 +367,11 @@ func FilterAbove(elements []*ParsedElement, anchor *ParsedElement) []*ParsedElem
 		}
 	}
 
-	// Sort by distance (closest first - highest Y value)
-	sortByDistanceYReverse(result, anchorTop)
 	return result
 }
 
 // FilterLeftOf returns elements left of the anchor element.
+// Input order is preserved (see header above).
 func FilterLeftOf(elements []*ParsedElement, anchor *ParsedElement) []*ParsedElement {
 	anchorLeft := anchor.Bounds.X
 	var result []*ParsedElement
@@ -365,11 +384,11 @@ func FilterLeftOf(elements []*ParsedElement, anchor *ParsedElement) []*ParsedEle
 		}
 	}
 
-	sortByDistanceXReverse(result, anchorLeft)
 	return result
 }
 
 // FilterRightOf returns elements right of the anchor element.
+// Input order is preserved (see header above).
 func FilterRightOf(elements []*ParsedElement, anchor *ParsedElement) []*ParsedElement {
 	anchorRight := anchor.Bounds.X + anchor.Bounds.Width
 	var result []*ParsedElement
@@ -381,7 +400,6 @@ func FilterRightOf(elements []*ParsedElement, anchor *ParsedElement) []*ParsedEl
 		}
 	}
 
-	sortByDistanceX(result, anchorRight)
 	return result
 }
 
@@ -433,53 +451,21 @@ func isInside(inner, outer core.Bounds) bool {
 		inner.Y+inner.Height <= outer.Y+outer.Height
 }
 
-// Simple sorting by distance (not using sort package to keep it simple)
-func sortByDistanceY(elements []*ParsedElement, refY int) {
-	for i := 0; i < len(elements); i++ {
-		for j := i + 1; j < len(elements); j++ {
-			distI := elements[i].Bounds.Y - refY
-			distJ := elements[j].Bounds.Y - refY
-			if distJ < distI {
-				elements[i], elements[j] = elements[j], elements[i]
-			}
+// sortByPosition returns a copy of elements sorted by on-screen position:
+// top-to-bottom, then left-to-right. This is Maestro's INDEX_COMPARATOR
+// (compareBy bounds.y, then bounds.x), used only when a selector carries an
+// explicit `index:`. The sort is stable, so position ties keep hierarchy
+// order.
+func sortByPosition(elements []*ParsedElement) []*ParsedElement {
+	sorted := make([]*ParsedElement, len(elements))
+	copy(sorted, elements)
+	sort.SliceStable(sorted, func(i, j int) bool {
+		if sorted[i].Bounds.Y != sorted[j].Bounds.Y {
+			return sorted[i].Bounds.Y < sorted[j].Bounds.Y
 		}
-	}
-}
-
-func sortByDistanceYReverse(elements []*ParsedElement, refY int) {
-	for i := 0; i < len(elements); i++ {
-		for j := i + 1; j < len(elements); j++ {
-			distI := refY - (elements[i].Bounds.Y + elements[i].Bounds.Height)
-			distJ := refY - (elements[j].Bounds.Y + elements[j].Bounds.Height)
-			if distJ < distI {
-				elements[i], elements[j] = elements[j], elements[i]
-			}
-		}
-	}
-}
-
-func sortByDistanceX(elements []*ParsedElement, refX int) {
-	for i := 0; i < len(elements); i++ {
-		for j := i + 1; j < len(elements); j++ {
-			distI := elements[i].Bounds.X - refX
-			distJ := elements[j].Bounds.X - refX
-			if distJ < distI {
-				elements[i], elements[j] = elements[j], elements[i]
-			}
-		}
-	}
-}
-
-func sortByDistanceXReverse(elements []*ParsedElement, refX int) {
-	for i := 0; i < len(elements); i++ {
-		for j := i + 1; j < len(elements); j++ {
-			distI := refX - (elements[i].Bounds.X + elements[i].Bounds.Width)
-			distJ := refX - (elements[j].Bounds.X + elements[j].Bounds.Width)
-			if distJ < distI {
-				elements[i], elements[j] = elements[j], elements[i]
-			}
-		}
-	}
+		return sorted[i].Bounds.X < sorted[j].Bounds.X
+	})
+	return sorted
 }
 
 // FilterContainsDescendants returns elements that contain ALL specified descendants.
@@ -514,7 +500,11 @@ func containsAllDescendants(parent *ParsedElement, allElements []*ParsedElement,
 }
 
 // DeepestMatchingElement returns the element with the highest depth (deepest in hierarchy).
-// This helps avoid tapping on container elements when a more specific child matches.
+//
+// Deprecated for candidate selection: Maestro does not pick the globally
+// deepest node (see the position-filter header above). Retained for
+// compatibility; new code should use DeepestMatchingPerBranch plus
+// order-preserving selection.
 func DeepestMatchingElement(elements []*ParsedElement) *ParsedElement {
 	if len(elements) == 0 {
 		return nil
@@ -529,28 +519,73 @@ func DeepestMatchingElement(elements []*ParsedElement) *ParsedElement {
 	return deepest
 }
 
-// SelectByIndex picks an element from candidates using the selector's index.
-// If index is specified, picks the Nth candidate (supports negative indexing from end).
-// If index is out of range, defaults to first element.
-// If no index, returns DeepestMatchingElement (or first if nil).
-func SelectByIndex(candidates []*ParsedElement, index string) *ParsedElement {
-	if index != "" {
-		idx := 0
-		if i, err := strconv.Atoi(index); err == nil {
-			if i < 0 {
-				i = len(candidates) + i
+// DeepestMatchingPerBranch drops every candidate that has a candidate
+// descendant, keeping only the deepest match on each branch of the
+// hierarchy. Matches Maestro's Filters.deepestMatchingElement applied to
+// the basic (non-relative) filters: when a container and its child both
+// match the selector, only the child competes. Input (hierarchy) order is
+// preserved.
+func DeepestMatchingPerBranch(candidates []*ParsedElement) []*ParsedElement {
+	if len(candidates) == 0 {
+		return candidates
+	}
+
+	// Mark every node that is an ancestor of some candidate; candidates so
+	// marked have a matching descendant and are dropped.
+	ancestorOfCandidate := make(map[*ParsedElement]bool, len(candidates))
+	for _, c := range candidates {
+		for p := c.Parent; p != nil; p = p.Parent {
+			if ancestorOfCandidate[p] {
+				break // everything above p is already marked
 			}
-			if i >= 0 && i < len(candidates) {
-				idx = i
-			}
+			ancestorOfCandidate[p] = true
 		}
-		return candidates[idx]
 	}
-	selected := DeepestMatchingElement(candidates)
-	if selected == nil {
-		return candidates[0]
+
+	var result []*ParsedElement
+	for _, c := range candidates {
+		if !ancestorOfCandidate[c] {
+			result = append(result, c)
+		}
 	}
-	return selected
+	return result
+}
+
+// SelectByIndex picks an element from candidates using the selector's index.
+//
+// Defect fix (see the position-filter header for the full story): with no
+// explicit index this used to return the globally DEEPEST candidate,
+// discarding the ordering established upstream (hierarchy order +
+// SortClickableFirst) — that is how a bottom-nav label beat the on-row tab
+// the leftOf anchor was meant to select. Reference behaviour (Maestro
+// Orchestra.buildFilter + Filters.index, measured on device):
+//   - no index: return the FIRST candidate, honouring the established
+//     ordering (hierarchy order, stable clickable-first).
+//   - explicit index: sort candidates by position (Maestro's
+//     INDEX_COMPARATOR: bounds.y, then bounds.x) and pick the Nth; negative
+//     counts from the end; out of range yields nil ("element not found").
+//
+// An unparseable index is tolerated as "no index" (Maestro would fail the
+// command; keeping the runner's historical leniency there).
+func SelectByIndex(candidates []*ParsedElement, index string) *ParsedElement {
+	if len(candidates) == 0 {
+		return nil
+	}
+
+	if index != "" {
+		if i, err := strconv.Atoi(index); err == nil {
+			sorted := sortByPosition(candidates)
+			if i < 0 {
+				i = len(sorted) + i
+			}
+			if i < 0 || i >= len(sorted) {
+				return nil
+			}
+			return sorted[i]
+		}
+	}
+
+	return candidates[0]
 }
 
 // SortClickableFirst reorders elements to prioritize clickable ones.

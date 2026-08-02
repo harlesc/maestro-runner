@@ -23,6 +23,22 @@ import (
 // Tap Commands
 // ============================================================================
 
+// tapOnStrategies orders locator strategies for a text/id tap: general
+// (matched-node) strategies first, clickable-only variants as fallback.
+// Order matters — the first strategy that matches decides WHERE the tap
+// lands. General strategies find the node bearing the text and the agent
+// clicks that node's centre (Maestro parity). The clickable-only fallback
+// preserves the ancestor-promotion escape hatch for trees where the text
+// is otherwise unreachable; it runs only when no general strategy matched.
+func tapOnStrategies(sel flow.Selector) ([]LocatorStrategy, error) {
+	allStrategies, err := buildSelectors(sel, 0)
+	if err != nil {
+		return nil, err
+	}
+	clickableStrategies, _ := buildClickableOnlyStrategies(sel)
+	return append(allStrategies, clickableStrategies...), nil
+}
+
 func (d *Driver) tapOn(step *flow.TapOnStep) *core.CommandResult {
 	// Check if using Point WITHOUT selector (screen-relative tap)
 	if step.Point != "" && step.Selector.IsEmpty() {
@@ -48,16 +64,41 @@ func (d *Driver) tapOn(step *flow.TapOnStep) *core.CommandResult {
 			return d.tapOnBrowser(step)
 		}
 
-		// Clickable-first: prefer buttons over labels. The agent promotes a text
-		// match to its nearest clickable ancestor when .clickable(true) is set,
-		// so "tapOn: SIGN IN" hits the clickable login-button ViewGroup even
-		// when the text lives on a non-clickable TextView child.
-		clickableStrategies, _ := buildClickableOnlyStrategies(step.Selector)
-		allStrategies, err := buildSelectors(step.Selector, 0)
+		// Matched-node strategies FIRST: the tap must land at the centre of
+		// the node that bears the text — Maestro taps
+		// (refreshedElement ?: element).bounds.center(), never a promoted
+		// ancestor. Clickable-only strategies stay as fallback: with
+		// .clickable(true) the agent PROMOTES a text match to its nearest
+		// clickable ancestor and clicks the ANCESTOR's centre, which can be
+		// a different, possibly covered, point.
+		//
+		// Defect (confirmed by measurement): menu row with a non-clickable
+		// label inside a clickable full-width row, plus a transparent
+		// touch-consuming overlay at the row's centre. Geometry replay (raw
+		// input tap): label centre (271,428) activates the row; row centre
+		// (540,428) is eaten by the overlay; off-centre (800,428) activates.
+		// Settled screen, single text tap (3/3 vs 3/3, logs): pre-fix the
+		// runner used textContains(X).clickable(true), promoted to the row
+		// [44,340][1036,517] and clicked its centre (540,428) → "overlay
+		// tapped" (PASS, row never activated); post-fix it finds the label
+		// [99,395][444,462] and clicks (271,428) → "row 2 activated".
+		// Maestro CLI 2.7.0 activates (5/5 across variants).
+		//
+		// Residual, NOT fixed here: with a screen transition in flight the
+		// agent's findAndClick can still click a stale mid-animation
+		// position (observed 2/3 post-fix runs clicking the label's
+		// mid-slide bounds; the pre-tap waitForAppToSettle /
+		// refreshElementUntilStable that Maestro does is a separate,
+		// larger piece of work).
+		//
+		// See 8358bf7 for why clickable-first was introduced (RN
+		// disambiguation); Maestro instead prefers clickable CANDIDATES
+		// bearing the text and still taps the matched node's centre, so a
+		// plain label tap works through ordinary touch dispatch.
+		strategies, err := tapOnStrategies(step.Selector)
 		if err != nil {
 			return errorResult(err, fmt.Sprintf("Failed to build selectors: %v", err))
 		}
-		strategies := append(clickableStrategies, allStrategies...)
 		timeout := d.calculateTimeout(step.IsOptional(), step.TimeoutMs)
 		ctx, cancel := context.WithTimeout(d.parentContext(), timeout)
 		defer cancel()
@@ -141,6 +182,32 @@ func (d *Driver) tapOn(step *flow.TapOnStep) *core.CommandResult {
 						return successResult("Tapped on element", info)
 					}
 					lastErr = err
+				}
+
+				// WebView/DOM fallback: on WebView-hosted screens the native
+				// accessibility tree may not carry the DOM id at all
+				// (verified: a uiautomator dump of a WebView login form shows
+				// resource-id="" on every input, so UiSelector resourceId/
+				// resourceIdMatches can never match `id:` there — the
+				// downstream defect-H error). Native strategies keep
+				// precedence — no behaviour change on native screens, and on
+				// hybrid screens a native match still wins. Only when ALL
+				// native strategies miss and a WebView is connected, resolve
+				// the selector against the DOM and tap through CDP (same
+				// mechanism as tapOnBrowser, which browser mode uses).
+				if d.webView != nil && d.webView.isConnected() {
+					webElem, werr := d.webView.findWebOnce(step.Selector)
+					if werr == nil {
+						if we, ok := webElem.(interface{ Click() error }); ok {
+							logger.Info("[devicelab] tap via CDP for %s (native strategies missed on a WebView screen)",
+								step.Selector.Describe())
+							if clickErr := we.Click(); clickErr != nil {
+								lastErr = fmt.Errorf("CDP tap failed: %w", clickErr)
+							} else {
+								return successResult("Tapped on element", webElem.Info())
+							}
+						}
+					}
 				}
 			}
 		}
@@ -471,6 +538,63 @@ func (d *Driver) assertNotVisibleBrowser(sel flow.Selector, timeoutMs int) *core
 // Input Commands
 // ============================================================================
 
+// typeNative types text into the focused native field with REAL KEY EVENTS.
+//
+// incident:settext-is-discarded-by-react-native — Android native text entry must never go through
+// Element.SendKeys / Element.Clear. Those are the WebDriver `/element/{id}/value` and `/clear`
+// endpoints, which uiautomator2 serves with AccessibilityNodeInfo ACTION_SET_TEXT. That writes the
+// EditText buffer directly and never enters the IME pipeline, so a controlled React Native
+// TextInput — whose value is owned by JS state and re-asserted on the next render — never sees an
+// onChangeText and discards it.
+//
+// Measured twice, on two Android emulators, with an interleaved A/B on four adjacent fields of
+// one React Native form:
+//
+//	PASS inputText "bbbkeypressbbb" (keyPress)  -> PASS assertVisible "bbbkeypressbbb"
+//	PASS inputText "aaasettextaaa"  (setText)   -> FAIL assertVisible "bbbkeypressbbb"
+//
+// So ACTION_SET_TEXT is worse than a no-op: its own value never lands AND it destroys text already
+// entered in OTHER fields of the same form. Every call returned OK at the wire level (12 x
+// `UI.activeElement` + 6 x `Input.sendKeys`, all OK, 5-22ms each), which is why five signup flows
+// reported 34 green steps against a visibly empty form — a green step that did nothing.
+//
+// The Maestro CLI, which passes all of these flows, never uses ACTION_SET_TEXT either: its on-device
+// driver types with uiDevice.pressKeyCode per character (MaestroDriverService.kt inputText/setText).
+// SendKeyActions is the same idea over the W3C Actions API, and the uiautomator2 client's own
+// comment already says it "triggers TextWatcher and onTextChanged events (unlike SendKeys/setText)".
+//
+// incident:stale-agent-apk-lowercases-every-capital — typeNative is a one-liner, but WHICH agent
+// APK is on the device decides whether it is correct, and nothing in this repo pins that.
+//
+// The DeviceLab agent used to synthesize key events without honouring the shifted layout, so every
+// capital arrived lower-case and Shift characters (#, $, @) were dropped entirely. Measured here on
+// 2026-08-02: "AbcXyz123" -> "abcxyz123" and "TWOPPPPPPPPPPPPP" -> "twoppppppppppppp", through BOTH
+// Input.pressKeyCode and Input.sendKeyActions. Not cosmetic — the verified-signup path needs the
+// magic middle name TWOPPPPPPPPPPPPP, and the generated password ("A" + 8 lower + digit) fails the
+// app's own "Password must include lower and upper case", so the signup cannot submit.
+//
+// That is upstream #132 / #135, fixed in the AGENT (typing now goes through KeyCharacterMap) and
+// released in v1.1.22. This machine's ~/.maestro-runner/drivers/android was downloaded before that
+// release and therefore still carried the broken agent; refreshing it fixed case verbatim.
+//
+// SO: the agent APK is a real, unpinned dependency of correctness. It lives OUTSIDE the checkout,
+// the Go module does not carry it, and `InstallDeviceLabDriver` only reinstalls on a version
+// change — while both the broken and fixed APKs report versionName 1.0.0. A stale one is therefore
+// invisible and sticky, so an embedder is well advised to assert the agent version explicitly.
+//
+// An earlier revision of this patch worked around the broken agent by shelling out to
+// `input text`. That is REMOVED, deliberately: it was a divergence from upstream carrying its own
+// escaping rules (%s, quoting) and its own ordering hazard, and it existed only to compensate for
+// an out-of-date dependency. Do not reintroduce it — update the agent instead.
+//
+// A WARNING FOR ANY FUTURE CHANGE HERE: do not verify case with `assertVisible: text:`. That
+// selector compiles to a "(?is)" regex — the `i` is case-INSENSITIVE — so it passes on lower-case
+// text and reports a fix that has not happened. It did exactly that to this patch once, and cost a
+// full 12-flow measurement round. Read the captured hierarchy instead.
+func (d *Driver) typeNative(text string) error {
+	return d.client.SendKeyActions(text)
+}
+
 func (d *Driver) inputText(step *flow.InputTextStep) *core.CommandResult {
 	text := step.Text
 	if text == "" {
@@ -500,7 +624,16 @@ func (d *Driver) inputText(step *flow.InputTextStep) *core.CommandResult {
 			return errorResult(err, fmt.Sprintf("Element not found: %v", err))
 		}
 		if elem != nil {
-			if err := elem.SendKeys(text); err != nil {
+			// NATIVE: focus the element, then type with real key events. NOT
+			// elem.SendKeys — that is ACTION_SET_TEXT, which a controlled
+			// React Native TextInput discards (see typeNative's header).
+			// Clicking is how a text field takes focus, and it is what the
+			// flow-level `tapOn` + `inputText` pair every call site uses
+			// already does.
+			if err := elem.Click(); err != nil {
+				return errorResult(err, fmt.Sprintf("Failed to focus element for input: %v", err))
+			}
+			if err := d.typeNative(text); err != nil {
 				return errorResult(err, fmt.Sprintf("Failed to input text: %v", err))
 			}
 		} else if d.webView != nil && d.webView.isConnected() {
@@ -526,14 +659,22 @@ func (d *Driver) inputText(step *flow.InputTextStep) *core.CommandResult {
 		// dragged a fragile focused=true selector-search fallback with it.
 		// This reintroduction is a single findFocused round-trip with a
 		// plain key-events fallback — no selector search.
+		//
+		// The WEB branch keeps focused.Input (CDP); the NATIVE branch must
+		// not, because NativeElement.Input is ACTION_SET_TEXT. See
+		// typeNative's header for the measurement.
 		typed := false
 		if focused, err := d.findFocused(); err == nil && focused != nil {
-			if err := focused.Input(text); err == nil {
+			if _, isNative := focused.(*NativeElement); isNative {
+				if err := d.typeNative(text); err == nil {
+					typed = true
+				}
+			} else if err := focused.Input(text); err == nil {
 				typed = true
 			}
 		}
 		if !typed {
-			if err := d.client.SendKeyActions(text); err != nil {
+			if err := d.typeNative(text); err != nil {
 				return errorResult(err, fmt.Sprintf("Failed to input text: %v", err))
 			}
 		}
@@ -619,6 +760,28 @@ func (d *Driver) eraseText(step *flow.EraseTextStep) *core.CommandResult {
 	// Try using Element interface (supports both web and native)
 	focused, err := d.findFocused()
 	if err == nil {
+		// NATIVE: erase with DELETE keys, never focused.Clear(). Clear() is the same
+		// ACTION_SET_TEXT primitive typeNative exists to avoid — it is discarded by a
+		// controlled React Native TextInput, and on this app it already failed outright
+		// ("Failed to set text on element: e5") on 2 of 6 fields in the recorded run.
+		// Delete keys go through the IME pipeline, which is what such a field listens to.
+		// Bounded by the CURRENT length so an empty field costs nothing and a short one
+		// does not pay for all 50 of the default.
+		if _, isNative := focused.(*NativeElement); isNative {
+			presses := chars
+			if cur, textErr := focused.Text(); textErr == nil {
+				if l := len([]rune(cur)); l < presses {
+					presses = l
+				}
+			}
+			for i := 0; i < presses; i++ {
+				if err := d.client.PressKeyCode(uiautomator2.KeyCodeDelete); err != nil {
+					return errorResult(err, fmt.Sprintf("Failed to erase text: %v", err))
+				}
+			}
+			return successResult(fmt.Sprintf("Erased %d characters", presses), nil)
+		}
+
 		currentText, textErr := focused.Text()
 		if textErr == nil {
 			textLen := len([]rune(currentText))
@@ -681,22 +844,52 @@ func (d *Driver) eraseTextBrowser(chars int) *core.CommandResult {
 }
 
 func (d *Driver) hideKeyboard(_ *flow.HideKeyboardStep) *core.CommandResult {
-	// Retry up to 3 times — the on-device agent tries KEYCODE_ESCAPE first
-	// (keyboard-only, no navigation side-effects), then falls back to KEYCODE_BACK.
-	for attempt := 0; attempt < 3; attempt++ {
-		_ = d.client.HideKeyboard()
-
-		// Wait for keyboard to actually disappear (animation ~300ms).
-		deadline := time.Now().Add(500 * time.Millisecond)
-		for time.Now().Before(deadline) {
-			if !d.isKeyboardVisible() {
-				return successResult("Keyboard hidden", nil)
-			}
-			time.Sleep(100 * time.Millisecond)
-		}
+	// Nothing to hide — and this early return is load-bearing, not an optimisation. The agent
+	// falls back to KEYCODE_BACK, which NAVIGATES when there is no keyboard to swallow it, so an
+	// unconditional attempt walks the app back a screen and the next step fails looking for an
+	// element the driver has just left. See keyboardShown's incident note.
+	if d.device != nil && !d.keyboardShown() {
+		return successResult("Keyboard already hidden", nil)
 	}
 
-	return successResult("Hide keyboard (may not have been visible)", nil)
+	// EXACTLY ONE ATTEMPT. This used to retry up to 3 times, and the retry is what broke flows.
+	//
+	// The agent tries KEYCODE_ESCAPE and falls back to KEYCODE_BACK, so every attempt can cost a
+	// BACK — and a BACK with no keyboard to swallow it NAVIGATES. The visibility signal is not
+	// instantaneous (mInputShown lags the animation), so attempt 1 could close the keyboard, the
+	// 500ms poll could still read "visible", and attempt 2 then pressed BACK against a closed
+	// keyboard and popped the screen. Measured on sign-up-betstop-blocked, twice: hideKeyboard
+	// reported success in ~960ms and the app was back on the signup WELCOME screen, so the next
+	// step failed with "Element not found: signup-salutation-picker-text" — an element that existed,
+	// on a screen the driver had just left.
+	//
+	// The asymmetry decides it: a keyboard left open costs one obscured tap, which
+	// checkKeyboardBlocking already detects and reports honestly. A spurious BACK silently
+	// desynchronises the whole flow. So press once, verify generously, and if it is still up SAY SO
+	// rather than pressing again.
+	// ONE BACK, PRESSED HERE — not d.client.HideKeyboard().
+	//
+	// The agent's Input.hideKeyboard is documented as "try KEYCODE_ESCAPE, fall back to
+	// KEYCODE_BACK", and its own fallback decision is made with the same unreliable visibility
+	// signal this patch had to replace. Measured after the single-attempt change above: ONE
+	// hideKeyboard still left the app one screen back, which a lone BACK against an open keyboard
+	// cannot do — so the RPC is spending both keys in a single call.
+	//
+	// The Maestro CLI, which passes these flows, does exactly one thing here:
+	// `shell("input keyevent 4")` (AndroidDriver.hideKeyboard). Matching that is both the smaller
+	// behaviour and the proven one.
+	_ = d.client.PressKeyCode(uiautomator2.KeyCodeBack)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if !d.isKeyboardVisible() {
+			return successResult("Keyboard hidden", nil)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	return successResult("Hide keyboard requested (still reported visible; NOT retried — a second "+
+		"BACK would navigate)", nil)
 }
 
 func (d *Driver) inputRandom(step *flow.InputRandomStep) *core.CommandResult {
@@ -760,9 +953,9 @@ func (d *Driver) scrollUntilVisible(step *flow.ScrollUntilVisibleStep) *core.Com
 		direction = "down"
 	}
 
-	maxScrolls := 20
-	if step.MaxScrolls > 0 {
-		maxScrolls = step.MaxScrolls
+	maxScrolls := step.MaxScrolls
+	if maxScrolls <= 0 {
+		maxScrolls = defaultScrollCap()
 	}
 	timeout := 30 * time.Second
 	if step.TimeoutMs > 0 {
@@ -780,31 +973,252 @@ func (d *Driver) scrollUntilVisible(step *flow.ScrollUntilVisibleStep) *core.Com
 		return errorResult(err, "Failed to get screen size")
 	}
 
-	for i := 0; i < maxScrolls && time.Now().Before(deadline); i++ {
-		_, info, err := d.findElement(step.Element, true, 1000)
+	// centerRetries implements Maestro's retryCenterCount for centerElement:
+	// how many times we have seen the element sufficiently visible but not
+	// near the screen centre. Once it exceeds maxCenterRetries we give up
+	// centring (the content cannot scroll far enough — e.g. a bottom-pinned
+	// button) and fall back to the plain visibility criterion.
+	centerRetries := 0
+
+	scrolls := 0
+	for i := 0; ; i++ {
+		if maxScrolls > 0 && i >= maxScrolls {
+			break
+		}
+		if !time.Now().Before(deadline) {
+			break
+		}
+		_, info, err := d.findElement(step.Element, true, scrollFindTimeoutMs)
 		if err == nil && info != nil {
 			// The DeviceLab agent returns matches from the full view hierarchy,
 			// including items below the fold in a ScrollView. Verify the element
 			// actually overlaps the viewport before declaring success — otherwise
 			// scrollUntilVisible can short-circuit on iteration 0 without ever
 			// moving the screen.
-			if isElementOnScreen(info, width, height) {
+			visibility := visiblePercentage(info.Bounds, width, height)
+			logger.Info("[devicelab] scrollUntilVisible iter=%d: found text=%q bounds=[%d,%d][%d,%d] visibility=%.2f centerRetries=%d",
+				i, info.Text, info.Bounds.X, info.Bounds.Y,
+				info.Bounds.X+info.Bounds.Width, info.Bounds.Y+info.Bounds.Height,
+				visibility, centerRetries)
+			if step.CenterElement {
+				// Defect: `centerElement: true` was parsed into
+				// ScrollUntilVisibleStep.CenterElement but never read anywhere
+				// (single grep hit), so the element was scrolled INTO VIEW but
+				// not TOWARD THE CENTRE. Measured on device (synthetic
+				// scrollable form, expanded section, 3-button nav): the runner
+				// stopped with the submit button's centre at y≈2274-2283 —
+				// inside the [2208,2340] system navigation window, which
+				// consumes the tap (3/3 probes; the subsequent tapOn pressed
+				// Home), while Maestro CLI 2.7.0 scrolled on until centre
+				// y≈1405 and the tap landed (3/3).
+				//
+				// Reference behaviour (Maestro Orchestra.scrollUntilVisible +
+				// UiElement.isElementNearScreenCenter/getVisiblePercentage,
+				// v2.7.0): with centerElement, once the element is >10%
+				// visible, success additionally requires its centre to be in
+				// the half of the screen toward which content is being
+				// revealed, plus a 1/5-of-screen margin; after 4 failed
+				// centring retries (content cannot scroll far enough) the
+				// plain visibilityPercentage criterion applies instead.
+				visibility := visiblePercentage(info.Bounds, width, height)
+				if visibility > 0.1 && centerRetries <= maxCenterRetries {
+					if isElementNearScreenCenter(info.Bounds, direction, width, height) {
+						return successResult(fmt.Sprintf("Element found after %d scrolls", i), info)
+					}
+					centerRetries++
+				} else if visibility >= visibilityNormalized(step.VisibilityPercentage) {
+					return successResult(fmt.Sprintf("Element found after %d scrolls", i), info)
+				}
+			} else if isElementOnScreen(info, width, height) {
 				return successResult(fmt.Sprintf("Element found after %d scrolls", i), info)
 			}
 		} else if err != nil && !isElementNotFoundError(err) {
 			// Infrastructure failure (dead session, connection refused, etc.):
 			// surface immediately rather than silently looping through all scrolls.
 			return errorResult(err, "Failed to find element")
+		} else {
+			logger.Info("[devicelab] scrollUntilVisible iter=%d: not found (%v)", i, err)
 		}
 
-		if err := d.performScroll(direction, width, height, step.Engine, 0.3); err != nil {
+		if err := d.performScrollFromCenter(direction, width, height, step.Engine, step.Speed); err != nil {
 			return errorResult(err, fmt.Sprintf("Failed to scroll: %v", err))
 		}
+		scrolls++
 
-		time.Sleep(300 * time.Millisecond)
+		time.Sleep(scrollRetryDelay)
 	}
 
-	return errorResult(fmt.Errorf("element not found"), fmt.Sprintf("Element not found after %d scrolls", maxScrolls))
+	return errorResult(fmt.Errorf("element not found"),
+		fmt.Sprintf("Element not found after %d scrolls (timeout %dms)", scrolls, timeout.Milliseconds()))
+}
+
+// scrollRetryDelay is the pause between scrollUntilVisible iterations
+// (Maestro waits for the app to settle after each swipe; a fixed short
+// delay is the runner's existing approximation — the full settle-wait is
+// deliberately out of scope). scrollFindTimeoutMs bounds each per-
+// iteration element lookup. Vars so tests can shorten the loop.
+var (
+	scrollRetryDelay    = 300 * time.Millisecond
+	scrollFindTimeoutMs = 1000
+)
+
+// speedToDuration maps the step's speed (0-100) to a swipe duration in
+// milliseconds the way Maestro does (ScrollUntilVisibleCommand.
+// speedToDuration, v2.7.0): 1000*(100-speed)/100 + 1, so the default
+// speed 40 → 601ms. Unset (<=0) means Maestro's default of 40.
+func speedToDuration(speed int) int {
+	if speed <= 0 {
+		speed = 40
+	}
+	if speed > 100 {
+		speed = 100
+	}
+	return 1000*(100-speed)/100 + 1
+}
+
+// defaultScrollCap returns the scroll-count cap for a scrollUntilVisible
+// step that does not set maxScrolls. Maestro has no count cap (its
+// do/while is bounded by the step timeout only,
+// Orchestra.scrollUntilVisible v2.7.0). The runner keeps its historical
+// default of 20 out of the box — a genuinely-absent element then fails
+// fast and attributable instead of scrolling until the timeout — while
+// allowing a driver-level override for Maestro parity:
+//
+//	MAESTRO_DEVICELAB_SCROLL_MAX_SCROLLS unset → 20
+//	MAESTRO_DEVICELAB_SCROLL_MAX_SCROLLS=0    → no cap (Maestro parity)
+//	MAESTRO_DEVICELAB_SCROLL_MAX_SCROLLS=N    → default cap N
+//
+// A per-step maxScrolls: always wins over this default.
+func defaultScrollCap() int {
+	v := strings.TrimSpace(os.Getenv("MAESTRO_DEVICELAB_SCROLL_MAX_SCROLLS"))
+	if v == "" {
+		return 20
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		logger.Warn("scrollUntilVisible: invalid MAESTRO_DEVICELAB_SCROLL_MAX_SCROLLS=%q, using 20", v)
+		return 20
+	}
+	return n
+}
+
+// maestroSwipeEndpoints returns Maestro's swipeFromCenter endpoints
+// (AndroidDriver.swipe(elementPoint=centre, direction, durationMs),
+// v2.7.0): start at the EXACT screen centre, end 10% from the edge toward
+// the reveal direction (0.4 of the screen dimension). scrollUntilVisible
+// "down" reveals content below, i.e. a finger swipe UP toward 0.1H.
+//
+// Defect G: the previous gesture (0.3 of the dimension starting 0.15H
+// below centre) missed scrollable containers that occupy only the
+// screen's middle band — e.g. a modal dialog's ScrollView. The touch-DOWN
+// then landed below the scroller (on the dialog's button bar or the
+// dimmed background), the modal never scrolled, a target below the
+// modal's fold stayed pruned from the view hierarchy, and the step burned
+// its whole budget ("Element not found after 20 scrolls") while Maestro
+// CLI — whose centre-start swipe engages the modal's scroller — revealed
+// the element and passed. Measured on a synthetic modal (ScrollView
+// viewport y∈[672,1470] on a 2340-tall screen, target below its fold):
+// runner, every find missed (rc=1); Maestro CLI passed; engine-free
+// isolation: two raw swipes from (540,1521) left the content unmoved,
+// swipes from (540,1170) revealed the target.
+func maestroSwipeEndpoints(direction string, screenWidth, screenHeight int) (x1, y1, x2, y2 int) {
+	cx, cy := screenWidth/2, screenHeight/2
+	switch strings.ToLower(direction) {
+	case "down": // reveal below: finger swipe UP
+		return cx, cy, cx, screenHeight / 10
+	case "up": // reveal above: finger swipe DOWN
+		return cx, cy, cx, screenHeight * 9 / 10
+	case "left": // reveal left: finger swipe RIGHT
+		return cx, cy, screenWidth * 9 / 10, cy
+	case "right": // reveal right: finger swipe LEFT
+		return cx, cy, screenWidth / 10, cy
+	}
+	return cx, cy, cx, screenHeight / 10
+}
+
+// performScrollFromCenter dispatches scrollUntilVisible's per-iteration
+// gesture using Maestro's swipeFromCenter geometry (see
+// maestroSwipeEndpoints). Default ("" or "adb") uses adb input swipe;
+// "agent" uses the on-device agent's area scroll (unchanged semantics —
+// not covered by the defect-G measurements).
+func (d *Driver) performScrollFromCenter(direction string, width, height int, engine string, speed int) error {
+	useAgent := strings.EqualFold(engine, "agent")
+	if !useAgent {
+		if d.device != nil {
+			x1, y1, x2, y2 := maestroSwipeEndpoints(direction, width, height)
+			cmd := fmt.Sprintf("input swipe %d %d %d %d %d", x1, y1, x2, y2, speedToDuration(speed))
+			_, err := d.device.Shell(cmd)
+			return err
+		}
+		logger.Warn("scroll: ADB shell unavailable, falling back to agent gesture (may be unreliable on some Android skins)")
+	}
+	area := uiautomator2.NewRect(0, height/8, width, height*3/4)
+	return d.client.ScrollInArea(area, direction, 0.4, speedToDuration(speed))
+}
+
+// maxCenterRetries mirrors Maestro's maxRetryCenterCount (= 4) for the
+// centerElement option of scrollUntilVisible: the number of times the
+// element may be seen sufficiently visible but off-centre before the plain
+// visibility criterion takes over (the list cannot scroll it to the centre).
+const maxCenterRetries = 4
+
+// visibilityNormalized converts the step's visibilityPercentage to
+// Maestro's visibilityPercentageNormalized. Unset (<= 0) means Maestro's
+// default DEFAULT_ELEMENT_VISIBILITY_PERCENTAGE = 100, i.e. fully visible.
+// Note: Maestro computes this with integer division ((vp / 100).toDouble(),
+// so any vp < 100 collapses to 0.0 and passes trivially); we use float
+// division, which is the evident intent of the option.
+func visibilityNormalized(visibilityPercentage int) float64 {
+	if visibilityPercentage <= 0 {
+		return 1.0
+	}
+	return float64(visibilityPercentage) / 100.0
+}
+
+// visiblePercentage is Maestro's UiElement.getVisiblePercentage: the
+// fraction of the element's area overlapping the screen, with the
+// full-screen overflow case short-circuited to 1.0.
+func visiblePercentage(b core.Bounds, screenWidth, screenHeight int) float64 {
+	if b.Width == 0 && b.Height == 0 {
+		return 0.0
+	}
+	if b.X <= 0 && b.Y <= 0 && b.X+b.Width >= screenWidth && b.Y+b.Height >= screenHeight {
+		return 1.0
+	}
+	visibleX := max(0, min(b.X+b.Width, screenWidth)-max(b.X, 0))
+	visibleY := max(0, min(b.Y+b.Height, screenHeight)-max(b.Y, 0))
+	total := b.Width * b.Height
+	if total <= 0 {
+		return 0.0
+	}
+	return float64(visibleX*visibleY) / float64(total)
+}
+
+// isElementNearScreenCenter is Maestro's UiElement.isElementNearScreenCenter
+// with the ScrollDirection→SwipeDirection mapping folded in (Maestro's
+// scrollUntilVisible "down" means "reveal content below", i.e. a finger
+// swipe UP). The element counts as near the centre when its centre lies in
+// the half of the screen toward which content is being revealed, plus a
+// margin of one fifth of the screen dimension:
+//
+//	"down"  (reveal below): centre Y < screenCentreY + screenH/5
+//	"up"    (reveal above): centre Y > screenCentreY - screenH/5
+//	"right" (reveal right): centre X < screenCentreX + screenW/5
+//	"left"  (reveal left):  centre X > screenCentreX - screenW/5
+func isElementNearScreenCenter(b core.Bounds, direction string, screenWidth, screenHeight int) bool {
+	cx := b.X + b.Width/2
+	cy := b.Y + b.Height/2
+	switch strings.ToLower(direction) {
+	case "down":
+		return cy < screenHeight/2+screenHeight/5
+	case "up":
+		return cy > screenHeight/2-screenHeight/5
+	case "right":
+		return cx < screenWidth/2+screenWidth/5
+	case "left":
+		return cx > screenWidth/2-screenWidth/5
+	}
+	return false
 }
 
 // performScroll dispatches a scroll gesture using the engine selected by the

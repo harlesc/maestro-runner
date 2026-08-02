@@ -115,7 +115,7 @@ type Driver struct {
 	cdpStateFunc func() *core.CDPInfo
 
 	// WebView CDP connection manager (nil = not wired)
-	webView       *webViewManager
+	webView       webViewManagerIface
 	lastCDPScan   time.Time     // rate-limit ADB shell CDP scans
 	lastCDPResult *core.CDPInfo // cached result from last scan
 	knownCDPType  string        // "browser" or "webview" — set from socket name, cleared on CDP down
@@ -825,11 +825,39 @@ func (d *Driver) isBrowserForeground() bool {
 }
 
 // findFocused returns the currently focused element as a core.Element.
-// Tries Rod first (`:focus` selector), then native ActiveElement().
+//
+// incident:stale-webview-dom-steals-the-focus — the order is NOT "Rod first". A CDP connection
+// outlives the screen that opened it: after the Hydra login WebView, the app navigates to native
+// Compose screens while the WebView stays alive in the background with its DOM focus intact. Rod
+// first therefore returned an input on a page nobody could see, and text typed into it vanished
+// while the step reported PASS.
+//
+// Measured on a native password-reset form reached after a WebView login: the failure hierarchy
+// is a ComposeView with two EditTexts, ZERO WebView nodes, both fields empty and the date-of-birth
+// field focused=true — and the run's whole wire log contains not one Input.* call, because every
+// keystroke went to CDP instead. Maestro passes the same screen, because it has no DOM path at
+// all: it presses keys and lets Android route them to the focused view.
+//
+// So: a NATIVE element that genuinely holds focus wins. Rod is consulted only when nothing native
+// has focus, or when the thing holding it IS the WebView host — which is the case #122 wanted, a
+// CDP tap inside a WebView that is actually on screen. The class name costs nothing; the RPC has
+// always returned it.
 func (d *Driver) findFocused() (core.Element, error) {
 	d.ensureWebViewConnection()
 
-	// Try Rod first
+	embedded := d.webView == nil || d.webView.webViewType() != "browser"
+
+	// Native first when this is an embedded WebView (or none) AND something native, that is not
+	// the WebView host itself, holds focus.
+	if embedded {
+		if active, err := d.client.ActiveElement(); err == nil && active != nil {
+			if class, ok := active.CachedClass(); ok && class != "" && !isWebViewHostClass(class) {
+				return d.nativeElementFrom(active), nil
+			}
+		}
+	}
+
+	// Try Rod
 	if d.webView != nil && d.webView.isConnected() {
 		if elem, err := d.webView.findFocusedWeb(); err == nil {
 			return elem, nil
@@ -837,21 +865,33 @@ func (d *Driver) findFocused() (core.Element, error) {
 	}
 
 	// Try native
-	if d.webView == nil || d.webView.webViewType() != "browser" {
+	if embedded {
 		active, err := d.client.ActiveElement()
 		if err == nil && active != nil {
-			info := &core.ElementInfo{Visible: true, Enabled: true}
-			if text, textErr := active.Text(); textErr == nil {
-				info.Text = text
-			}
-			if rect, rectErr := active.Rect(); rectErr == nil {
-				info.Bounds = core.Bounds{X: rect.X, Y: rect.Y, Width: rect.Width, Height: rect.Height}
-			}
-			return &NativeElement{elem: active, client: d.client, info: info}, nil
+			return d.nativeElementFrom(active), nil
 		}
 	}
 
 	return nil, fmt.Errorf("no focused element")
+}
+
+// nativeElementFrom wraps a uiautomator2 element as a core.Element, reading the cached text/rect
+// the RPC already returned. One helper so the two findFocused branches cannot drift apart.
+func (d *Driver) nativeElementFrom(active *uiautomator2.Element) core.Element {
+	info := &core.ElementInfo{Visible: true, Enabled: true}
+	if text, textErr := active.Text(); textErr == nil {
+		info.Text = text
+	}
+	if rect, rectErr := active.Rect(); rectErr == nil {
+		info.Bounds = core.Bounds{X: rect.X, Y: rect.Y, Width: rect.Width, Height: rect.Height}
+	}
+	return &NativeElement{elem: active, client: d.client, info: info}
+}
+
+// isWebViewHostClass reports whether a focused-element class name is the WebView container rather
+// than a real native field. Only then is the DOM the right place to look for focus.
+func isWebViewHostClass(class string) bool {
+	return strings.Contains(class, "WebView")
 }
 
 // isBrowserMode returns true if we know the CDP target is a Chrome browser (not an embedded WebView).
@@ -1448,7 +1488,10 @@ func (d *Driver) resolveRelativeSelector(sel flow.Selector) (*core.ElementInfo, 
 
 	var candidates []*ParsedElement
 	if baseSel.Text != "" || baseSel.ID != "" || baseSel.Width > 0 || baseSel.Height > 0 {
-		candidates = FilterBySelector(allElements, baseSel)
+		// DeepestMatchingPerBranch: Maestro applies deepestMatchingElement to
+		// the basic filters, so container+child double matches leave only the
+		// child. Hierarchy order is preserved.
+		candidates = DeepestMatchingPerBranch(FilterBySelector(allElements, baseSel))
 	} else {
 		candidates = allElements
 	}
@@ -1467,17 +1510,21 @@ func (d *Driver) resolveRelativeSelector(sel flow.Selector) (*core.ElementInfo, 
 				}}
 			}
 		} else {
-			anchors = FilterBySelector(allElements, *anchorSelector)
+			anchors = DeepestMatchingPerBranch(FilterBySelector(allElements, *anchorSelector))
 		}
 	}
 
 	var matchingCandidates []*ParsedElement
 	if len(anchors) > 0 {
-		for _, anchor := range anchors {
-			filtered := applyRelativeFilter(candidates, anchor, filterType)
-			if len(filtered) > 0 {
-				matchingCandidates = filtered
-				break
+		// Maestro's relativeTo keeps a candidate if the predicate holds for
+		// ANY matching anchor (not just the first anchor with results), so
+		// take the union — preserving the candidates' hierarchy order.
+		for _, cand := range candidates {
+			for _, anchor := range anchors {
+				if len(applyRelativeFilter([]*ParsedElement{cand}, anchor, filterType)) > 0 {
+					matchingCandidates = append(matchingCandidates, cand)
+					break
+				}
 			}
 		}
 		candidates = matchingCandidates
@@ -1496,6 +1543,9 @@ func (d *Driver) resolveRelativeSelector(sel flow.Selector) (*core.ElementInfo, 
 	candidates = SortClickableFirst(candidates)
 
 	selected := SelectByIndex(candidates, sel.Index)
+	if selected == nil {
+		return nil, fmt.Errorf("no element at index %q among %d candidates", sel.Index, len(candidates))
+	}
 
 	clickableElem := GetClickableElement(selected)
 
@@ -1525,7 +1575,7 @@ func (d *Driver) findElementRelativeWithElements(sel flow.Selector, allElements 
 
 	var candidates []*ParsedElement
 	if baseSel.Text != "" || baseSel.ID != "" || baseSel.Width > 0 || baseSel.Height > 0 {
-		candidates = FilterBySelector(allElements, baseSel)
+		candidates = DeepestMatchingPerBranch(FilterBySelector(allElements, baseSel))
 	} else {
 		candidates = allElements
 	}
@@ -1544,17 +1594,20 @@ func (d *Driver) findElementRelativeWithElements(sel flow.Selector, allElements 
 				}}
 			}
 		} else {
-			anchors = FilterBySelector(allElements, *anchorSelector)
+			anchors = DeepestMatchingPerBranch(FilterBySelector(allElements, *anchorSelector))
 		}
 	}
 
 	var matchingCandidates []*ParsedElement
 	if len(anchors) > 0 {
-		for _, anchor := range anchors {
-			filtered := applyRelativeFilter(candidates, anchor, filterType)
-			if len(filtered) > 0 {
-				matchingCandidates = filtered
-				break
+		// Union over all anchors, preserving hierarchy order (see
+		// resolveRelativeSelector).
+		for _, cand := range candidates {
+			for _, anchor := range anchors {
+				if len(applyRelativeFilter([]*ParsedElement{cand}, anchor, filterType)) > 0 {
+					matchingCandidates = append(matchingCandidates, cand)
+					break
+				}
 			}
 		}
 		candidates = matchingCandidates
@@ -1573,6 +1626,9 @@ func (d *Driver) findElementRelativeWithElements(sel flow.Selector, allElements 
 	candidates = SortClickableFirst(candidates)
 
 	selected := SelectByIndex(candidates, sel.Index)
+	if selected == nil {
+		return nil, nil, fmt.Errorf("no element at index %q among %d candidates", sel.Index, len(candidates))
+	}
 
 	clickableElem := GetClickableElement(selected)
 
@@ -1602,7 +1658,7 @@ func (d *Driver) findElementByPageSourceOnce(sel flow.Selector) (*uiautomator2.E
 		return nil, nil, fmt.Errorf("failed to parse page source: %w", err)
 	}
 
-	candidates := FilterBySelector(allElements, sel)
+	candidates := DeepestMatchingPerBranch(FilterBySelector(allElements, sel))
 	candidates = SortClickableFirst(candidates)
 
 	if len(candidates) == 0 {
@@ -1610,6 +1666,9 @@ func (d *Driver) findElementByPageSourceOnce(sel flow.Selector) (*uiautomator2.E
 	}
 
 	selected := SelectByIndex(candidates, sel.Index)
+	if selected == nil {
+		return nil, nil, fmt.Errorf("no element at index %q among %d candidates", sel.Index, len(candidates))
+	}
 
 	clickableElem := GetClickableElement(selected)
 
@@ -1660,7 +1719,7 @@ func (d *Driver) findElementByPageSourceOnceInternal(sel flow.Selector) (*core.E
 		return nil, fmt.Errorf("failed to parse page source: %w", err)
 	}
 
-	candidates := FilterBySelector(allElements, sel)
+	candidates := DeepestMatchingPerBranch(FilterBySelector(allElements, sel))
 	candidates = SortClickableFirst(candidates)
 
 	if len(candidates) == 0 {
@@ -1668,6 +1727,9 @@ func (d *Driver) findElementByPageSourceOnceInternal(sel flow.Selector) (*core.E
 	}
 
 	selected := SelectByIndex(candidates, sel.Index)
+	if selected == nil {
+		return nil, fmt.Errorf("no element at index %q among %d candidates", sel.Index, len(candidates))
+	}
 
 	clickableElem := GetClickableElement(selected)
 

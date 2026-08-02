@@ -151,6 +151,15 @@ Examples:
 			EnvVars: []string{"MAESTRO_CONDITION_TIMEOUT"},
 		},
 		&cli.IntFlag{
+			Name: "optional-find-timeout",
+			Usage: "How long to look for an `optional: true` element before skipping it, in ms " +
+				"(0 = driver default: 7000 Android / 2000 iOS). A flow that probes for interstitials " +
+				"with several optional taps pays this ONCE PER NON-MATCHING TAP, so lowering it is " +
+				"the single biggest win on cold-start/dismissal flows.",
+			Value:   0,
+			EnvVars: []string{"MAESTRO_OPTIONAL_FIND_TIMEOUT"},
+		},
+		&cli.IntFlag{
 			Name:    "typing-frequency",
 			Usage:   "WDA typing speed in keys/sec (default 30). Lower values help React Native apps.",
 			Value:   30,
@@ -503,11 +512,12 @@ type RunConfig struct {
 	Capabilities      map[string]interface{} // Parsed Appium capabilities
 
 	// Driver settings
-	WaitForIdleTimeout int    // Wait for device idle in ms (0 = disabled, default 200)
-	ConditionTimeout   int    // Default timeout (ms) for when:/while: condition checks (default 1000)
-	TypingFrequency    int    // WDA typing frequency in keys/sec (0 = use WDA default of 60)
-	TeamID             string // Apple Development Team ID for WDA code signing
-	WDABundleID        string // Custom WDA bundle identifier
+	WaitForIdleTimeout  int    // Wait for device idle in ms (0 = disabled, default 200)
+	ConditionTimeout    int    // Default timeout (ms) for when:/while: condition checks (default 1000)
+	OptionalFindTimeout int    // Find budget for `optional: true` elements in ms (0 = driver default)
+	TypingFrequency     int    // WDA typing frequency in keys/sec (0 = use WDA default of 60)
+	TeamID              string // Apple Development Team ID for WDA code signing
+	WDABundleID         string // Custom WDA bundle identifier
 
 	// Emulator/Simulator management
 	StartEmulator     string // AVD name to start (e.g., Pixel_7_API_33)
@@ -686,44 +696,45 @@ func runTest(c *cli.Context) error {
 
 	// Build run configuration
 	cfg := &RunConfig{
-		FlowPaths:          c.Args().Slice(),
-		ConfigPath:         configPath,
-		Env:                mergedEnv,
-		IncludeTags:        getStringSlice("include-tags"),
-		ExcludeTags:        getStringSlice("exclude-tags"),
-		OutputDir:          outputDir,
-		Parallel:           getInt("parallel"),
-		Continuous:         getBool("continuous"),
-		Headed:             getBool("headed"),
-		Browser:            getString("browser"),
-		UserDataDir:        getString("user-data-dir"),
-		Platform:           getString("platform"),
-		Devices:            parseDevices(getString("device")),
-		Verbose:            getBool("verbose"),
-		AppFile:            getString("app-file"),
-		AppID:              appID,
-		Driver:             getString("driver"),
-		AppiumURL:          getString("appium-url"),
-		AppiumSessionFile:  getString("appium-session-file"),
-		CapsFile:           capsFile,
-		Capabilities:       caps,
-		WaitForIdleTimeout: getInt("wait-for-idle-timeout"),
-		ConditionTimeout:   getInt("condition-timeout"),
-		TypingFrequency:    getInt("typing-frequency"),
-		TeamID:             getString("team-id"),
-		WDABundleID:        getString("wda-bundle-id"),
-		StartEmulator:      getString("start-emulator"),
-		StartSimulator:     getString("start-simulator"),
-		AutoStartEmulator:  getBool("auto-start-emulator"),
-		ShutdownAfter:      getBool("shutdown-after"),
-		BootTimeout:        getInt("boot-timeout"),
-		DriverStartTimeout: getInt("driver-start-timeout"),
-		NoAppInstall:       getBool("no-app-install"),
-		NoDriverInstall:    getBool("no-driver-install"),
-		NoFlutterFallback:  getBool("no-flutter-fallback"),
-		AndroidTCPForward:  getBool("android-tcp-forward"),
-		Artifacts:          parseArtifactMode(getString("artifacts")),
-		UpdateScreenshots:  getBool("update-screenshots"),
+		FlowPaths:           c.Args().Slice(),
+		ConfigPath:          configPath,
+		Env:                 mergedEnv,
+		IncludeTags:         getStringSlice("include-tags"),
+		ExcludeTags:         getStringSlice("exclude-tags"),
+		OutputDir:           outputDir,
+		Parallel:            getInt("parallel"),
+		Continuous:          getBool("continuous"),
+		Headed:              getBool("headed"),
+		Browser:             getString("browser"),
+		UserDataDir:         getString("user-data-dir"),
+		Platform:            getString("platform"),
+		Devices:             parseDevices(getString("device")),
+		Verbose:             getBool("verbose"),
+		AppFile:             getString("app-file"),
+		AppID:               appID,
+		Driver:              getString("driver"),
+		AppiumURL:           getString("appium-url"),
+		AppiumSessionFile:   getString("appium-session-file"),
+		CapsFile:            capsFile,
+		Capabilities:        caps,
+		WaitForIdleTimeout:  getInt("wait-for-idle-timeout"),
+		ConditionTimeout:    getInt("condition-timeout"),
+		OptionalFindTimeout: getInt("optional-find-timeout"),
+		TypingFrequency:     getInt("typing-frequency"),
+		TeamID:              getString("team-id"),
+		WDABundleID:         getString("wda-bundle-id"),
+		StartEmulator:       getString("start-emulator"),
+		StartSimulator:      getString("start-simulator"),
+		AutoStartEmulator:   getBool("auto-start-emulator"),
+		ShutdownAfter:       getBool("shutdown-after"),
+		BootTimeout:         getInt("boot-timeout"),
+		DriverStartTimeout:  getInt("driver-start-timeout"),
+		NoAppInstall:        getBool("no-app-install"),
+		NoDriverInstall:     getBool("no-driver-install"),
+		NoFlutterFallback:   getBool("no-flutter-fallback"),
+		AndroidTCPForward:   getBool("android-tcp-forward"),
+		Artifacts:           parseArtifactMode(getString("artifacts")),
+		UpdateScreenshots:   getBool("update-screenshots"),
 	}
 
 	// Apply waitForIdleTimeout with priority:

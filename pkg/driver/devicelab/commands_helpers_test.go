@@ -963,19 +963,29 @@ func (h *hideKbClient) HideKeyboard() error {
 	return nil
 }
 
-func TestHideKeyboard_NoDevice_SucceedsImmediately(t *testing.T) {
-	// When d.device == nil, isKeyboardVisible() returns false on the first
-	// check (getKeyboardBounds returns nil without a shell), so
-	// hideKeyboard returns success after a single client call.
+func TestHideKeyboard_NoDevice_PressesBackOnceAndNeverUsesTheRPC(t *testing.T) {
+	// Without a device the keyboardShown() guard cannot run, so hideKeyboard falls through to its
+	// one-and-only attempt. Two properties are asserted, and both are the fix rather than
+	// bookkeeping:
+	//
+	//   - the Input.hideKeyboard RPC is NOT used. It is documented as "try KEYCODE_ESCAPE, fall
+	//     back to KEYCODE_BACK", i.e. it can spend two keys in one call, and a BACK with no
+	//     keyboard to swallow it NAVIGATES.
+	//   - exactly ONE back key is pressed. The retry loop this replaced could press a second BACK
+	//     after the first had already closed the keyboard, popping the screen — which presents
+	//     several steps later as a missing element that really does exist.
 	client := &hideKbClient{trackingClient: newTrackingClient()}
 	driver := New(client, &core.PlatformInfo{}, nil)
 
 	res := driver.hideKeyboard(&flow.HideKeyboardStep{})
 	if !res.Success {
-		t.Fatalf("hideKeyboard should succeed when keyboard is reported hidden: %v", res.Error)
+		t.Fatalf("hideKeyboard should succeed when the keyboard is reported hidden: %v", res.Error)
 	}
-	if client.hideCount != 1 {
-		t.Errorf("expected 1 HideKeyboard call (no retries), got %d", client.hideCount)
+	if client.hideCount != 0 {
+		t.Errorf("expected the HideKeyboard RPC to be unused, got %d call(s)", client.hideCount)
+	}
+	if len(client.pressKeyCodes) != 1 || client.pressKeyCodes[0] != uiautomator2.KeyCodeBack {
+		t.Errorf("expected exactly one KEYCODE_BACK, got %v", client.pressKeyCodes)
 	}
 }
 
@@ -2004,7 +2014,7 @@ func TestAssertVisible_NotFound(t *testing.T) {
 // TestInputText_NoSelector_PrefersFocusedElement locks in the #122 fix:
 // with a focused element available, typing is element-scoped (reaches
 // WebView DOM inputs) instead of blind key events.
-func TestInputText_NoSelector_PrefersFocusedElement(t *testing.T) {
+func TestInputText_NoSelector_NativeFocusTypesWithKeyEvents(t *testing.T) {
 	var typed string
 	client := &scriptedClient{trackingClient: newTrackingClient()}
 	client.activeElementReturn = makeFocusedElement("", &typed, nil, nil)
@@ -2014,11 +2024,15 @@ func TestInputText_NoSelector_PrefersFocusedElement(t *testing.T) {
 	if !res.Success {
 		t.Fatalf("inputText no-selector: %v", res.Error)
 	}
-	if typed != "hello" {
-		t.Errorf("expected element-scoped typing of %q, got %q", "hello", typed)
+	// findFocused resolves a native ActiveElement to a *NativeElement, and the NATIVE branch must
+	// type with key events. Element-scoped typing here would be NativeElement.Input, i.e.
+	// ACTION_SET_TEXT, which a controlled React Native TextInput discards — the field re-renders
+	// empty and the rest of the form is filled into the wrong place.
+	if typed != "" {
+		t.Errorf("expected NO element-scoped (ACTION_SET_TEXT) typing on the native path, got %q", typed)
 	}
-	if len(client.sendKeyActionsCalls) != 0 {
-		t.Errorf("expected no blind key actions, got %v", client.sendKeyActionsCalls)
+	if len(client.sendKeyActionsCalls) != 1 || client.sendKeyActionsCalls[0] != "hello" {
+		t.Errorf("expected key-event typing of %q, got %v", "hello", client.sendKeyActionsCalls)
 	}
 }
 
@@ -2074,10 +2088,18 @@ func TestInputText_EmptyText(t *testing.T) {
 	}
 }
 
-func TestInputText_WithSelector_UsesElementSendKeys(t *testing.T) {
+func TestInputText_WithSelector_FocusesThenTypesWithKeyEvents(t *testing.T) {
+	// The selector path must CLICK the element to give it focus and then type with real key
+	// events. It must NOT call Element.SendKeys: that is ACTION_SET_TEXT, which a controlled
+	// React Native TextInput discards.
 	client := &scriptedClient{trackingClient: newTrackingClient()}
 	sendKeysCallText := ""
+	clicks := 0
 	elem := uiautomator2.NewCachedElement("id", "", uiautomator2.ElementRect{X: 0, Y: 0, Width: 100, Height: 50})
+	elem.SetClickFunc(func() error {
+		clicks++
+		return nil
+	})
 	elem.SetSendKeysFunc(func(text string) error {
 		sendKeysCallText = text
 		return nil
@@ -2092,8 +2114,14 @@ func TestInputText_WithSelector_UsesElementSendKeys(t *testing.T) {
 	if !res.Success {
 		t.Fatalf("inputText with selector: %v", res.Error)
 	}
-	if sendKeysCallText != "hello" {
-		t.Errorf("SendKeysFunc received %q, want %q", sendKeysCallText, "hello")
+	if clicks != 1 {
+		t.Errorf("expected the element to be clicked once for focus, got %d", clicks)
+	}
+	if sendKeysCallText != "" {
+		t.Errorf("expected SendKeys (ACTION_SET_TEXT) NOT to be used, got %q", sendKeysCallText)
+	}
+	if len(client.sendKeyActionsCalls) != 1 || client.sendKeyActionsCalls[0] != "hello" {
+		t.Errorf("expected key-event typing of %q, got %v", "hello", client.sendKeyActionsCalls)
 	}
 }
 
@@ -3039,41 +3067,62 @@ func TestPasteText_NoFocusedElement(t *testing.T) {
 }
 
 // =============================================================================
-// eraseText — focused-element happy path (covers the Clear branch)
+// eraseText — focused-element happy path (NATIVE: delete keys, never Clear)
 // =============================================================================
+//
+// A native focused element is erased with DELETE key presses, never with Element.Clear() +
+// re-Input. Clear/Input are the same ACTION_SET_TEXT primitive that typeNative exists to avoid: a
+// controlled React Native TextInput discards it, and on a real hybrid app it was measured to fail
+// outright ("Failed to set text on element") on some fields. Delete keys go through the IME
+// pipeline, which is what such a field listens to.
+//
+// The press count is bounded by the field's CURRENT length, so an empty field costs nothing and a
+// short one does not pay for all 50 of the default.
 
-func TestEraseText_ClearsAllWhenCharsGE_TextLen(t *testing.T) {
+func TestEraseText_NativeDeletesUpToTheCurrentLength(t *testing.T) {
 	clearCount := 0
 	client := &scriptedClient{trackingClient: newTrackingClient()}
 	client.activeElementReturn = makeFocusedElement("Hello", nil, &clearCount, nil)
 	driver := New(client, &core.PlatformInfo{}, &mockShell{})
 
-	res := driver.eraseText(&flow.EraseTextStep{Characters: 10}) // > 5 → clears all
+	res := driver.eraseText(&flow.EraseTextStep{Characters: 10}) // 10 > len("Hello")
 	if !res.Success {
 		t.Fatalf("eraseText: %v", res.Error)
 	}
-	if clearCount != 1 {
-		t.Errorf("expected 1 Clear call, got %d", clearCount)
+	if clearCount != 0 {
+		t.Errorf("expected Clear (ACTION_SET_TEXT) NOT to be used, got %d call(s)", clearCount)
+	}
+	if len(client.pressKeyCodes) != 5 {
+		t.Errorf("expected 5 deletes (bounded by the current length), got %d: %v",
+			len(client.pressKeyCodes), client.pressKeyCodes)
+	}
+	for i, kc := range client.pressKeyCodes {
+		if kc != uiautomator2.KeyCodeDelete {
+			t.Errorf("press %d: expected KEYCODE_DEL, got %d", i, kc)
+		}
 	}
 }
 
-func TestEraseText_PartialErase(t *testing.T) {
+func TestEraseText_NativePartialErase(t *testing.T) {
 	var typed string
 	clearCount := 0
 	client := &scriptedClient{trackingClient: newTrackingClient()}
 	client.activeElementReturn = makeFocusedElement("Hello", &typed, &clearCount, nil)
 	driver := New(client, &core.PlatformInfo{}, &mockShell{})
 
-	// 2 chars off "Hello" → leaves "Hel"
+	// 2 chars off "Hello" → two deletes, and NO clear-and-retype round trip.
 	res := driver.eraseText(&flow.EraseTextStep{Characters: 2})
 	if !res.Success {
 		t.Fatalf("eraseText partial: %v", res.Error)
 	}
-	if clearCount != 1 {
-		t.Errorf("expected Clear before re-input, got %d", clearCount)
+	if clearCount != 0 {
+		t.Errorf("expected Clear (ACTION_SET_TEXT) NOT to be used, got %d call(s)", clearCount)
 	}
-	if typed != "Hel" {
-		t.Errorf("expected re-input \"Hel\", got %q", typed)
+	if typed != "" {
+		t.Errorf("expected no re-input of the remaining text, got %q", typed)
+	}
+	if len(client.pressKeyCodes) != 2 {
+		t.Errorf("expected 2 deletes, got %d: %v", len(client.pressKeyCodes), client.pressKeyCodes)
 	}
 }
 
