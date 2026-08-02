@@ -76,6 +76,10 @@ func (a *Adapter) ActiveElement() (*uiautomator2.Element, error) {
 			Height: result.Bounds.Height,
 		},
 	)
+	// The class name decides whether the focused thing is a real native field or the WebView
+	// host — see Driver.findFocused. It is already on the wire; only the cached constructor
+	// dropped it.
+	elem.SetCachedClass(result.ClassName)
 	a.wireElementActions(elem, result.ElementID)
 	return elem, nil
 }

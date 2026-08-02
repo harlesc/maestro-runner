@@ -471,6 +471,63 @@ func (d *Driver) assertNotVisibleBrowser(sel flow.Selector, timeoutMs int) *core
 // Input Commands
 // ============================================================================
 
+// typeNative types text into the focused native field with REAL KEY EVENTS.
+//
+// incident:settext-is-discarded-by-react-native — Android native text entry must never go through
+// Element.SendKeys / Element.Clear. Those are the WebDriver `/element/{id}/value` and `/clear`
+// endpoints, which uiautomator2 serves with AccessibilityNodeInfo ACTION_SET_TEXT. That writes the
+// EditText buffer directly and never enters the IME pipeline, so a controlled React Native
+// TextInput — whose value is owned by JS state and re-asserted on the next render — never sees an
+// onChangeText and discards it.
+//
+// Measured twice, on two Android emulators, with an interleaved A/B on four adjacent fields of
+// one React Native form:
+//
+//	PASS inputText "bbbkeypressbbb" (keyPress)  -> PASS assertVisible "bbbkeypressbbb"
+//	PASS inputText "aaasettextaaa"  (setText)   -> FAIL assertVisible "bbbkeypressbbb"
+//
+// So ACTION_SET_TEXT is worse than a no-op: its own value never lands AND it destroys text already
+// entered in OTHER fields of the same form. Every call returned OK at the wire level (12 x
+// `UI.activeElement` + 6 x `Input.sendKeys`, all OK, 5-22ms each), which is why five signup flows
+// reported 34 green steps against a visibly empty form — a green step that did nothing.
+//
+// The Maestro CLI, which passes all of these flows, never uses ACTION_SET_TEXT either: its on-device
+// driver types with uiDevice.pressKeyCode per character (MaestroDriverService.kt inputText/setText).
+// SendKeyActions is the same idea over the W3C Actions API, and the uiautomator2 client's own
+// comment already says it "triggers TextWatcher and onTextChanged events (unlike SendKeys/setText)".
+//
+// incident:stale-agent-apk-lowercases-every-capital — typeNative is a one-liner, but WHICH agent
+// APK is on the device decides whether it is correct, and nothing in this repo pins that.
+//
+// The DeviceLab agent used to synthesize key events without honouring the shifted layout, so every
+// capital arrived lower-case and Shift characters (#, $, @) were dropped entirely. Measured here on
+// 2026-08-02: "AbcXyz123" -> "abcxyz123" and "TWOPPPPPPPPPPPPP" -> "twoppppppppppppp", through BOTH
+// Input.pressKeyCode and Input.sendKeyActions. Not cosmetic — the verified-signup path needs the
+// magic middle name TWOPPPPPPPPPPPPP, and the generated password ("A" + 8 lower + digit) fails the
+// app's own "Password must include lower and upper case", so the signup cannot submit.
+//
+// That is upstream #132 / #135, fixed in the AGENT (typing now goes through KeyCharacterMap) and
+// released in v1.1.22. This machine's ~/.maestro-runner/drivers/android was downloaded before that
+// release and therefore still carried the broken agent; refreshing it fixed case verbatim.
+//
+// SO: the agent APK is a real, unpinned dependency of correctness. It lives OUTSIDE the checkout,
+// the Go module does not carry it, and `InstallDeviceLabDriver` only reinstalls on a version
+// change — while both the broken and fixed APKs report versionName 1.0.0. A stale one is therefore
+// invisible and sticky, so an embedder is well advised to assert the agent version explicitly.
+//
+// An earlier revision of this patch worked around the broken agent by shelling out to
+// `input text`. That is REMOVED, deliberately: it was a divergence from upstream carrying its own
+// escaping rules (%s, quoting) and its own ordering hazard, and it existed only to compensate for
+// an out-of-date dependency. Do not reintroduce it — update the agent instead.
+//
+// A WARNING FOR ANY FUTURE CHANGE HERE: do not verify case with `assertVisible: text:`. That
+// selector compiles to a "(?is)" regex — the `i` is case-INSENSITIVE — so it passes on lower-case
+// text and reports a fix that has not happened. It did exactly that to this patch once, and cost a
+// full 12-flow measurement round. Read the captured hierarchy instead.
+func (d *Driver) typeNative(text string) error {
+	return d.client.SendKeyActions(text)
+}
+
 func (d *Driver) inputText(step *flow.InputTextStep) *core.CommandResult {
 	text := step.Text
 	if text == "" {
@@ -500,7 +557,16 @@ func (d *Driver) inputText(step *flow.InputTextStep) *core.CommandResult {
 			return errorResult(err, fmt.Sprintf("Element not found: %v", err))
 		}
 		if elem != nil {
-			if err := elem.SendKeys(text); err != nil {
+			// NATIVE: focus the element, then type with real key events. NOT
+			// elem.SendKeys — that is ACTION_SET_TEXT, which a controlled
+			// React Native TextInput discards (see typeNative's header).
+			// Clicking is how a text field takes focus, and it is what the
+			// flow-level `tapOn` + `inputText` pair every call site uses
+			// already does.
+			if err := elem.Click(); err != nil {
+				return errorResult(err, fmt.Sprintf("Failed to focus element for input: %v", err))
+			}
+			if err := d.typeNative(text); err != nil {
 				return errorResult(err, fmt.Sprintf("Failed to input text: %v", err))
 			}
 		} else if d.webView != nil && d.webView.isConnected() {
@@ -526,14 +592,22 @@ func (d *Driver) inputText(step *flow.InputTextStep) *core.CommandResult {
 		// dragged a fragile focused=true selector-search fallback with it.
 		// This reintroduction is a single findFocused round-trip with a
 		// plain key-events fallback — no selector search.
+		//
+		// The WEB branch keeps focused.Input (CDP); the NATIVE branch must
+		// not, because NativeElement.Input is ACTION_SET_TEXT. See
+		// typeNative's header for the measurement.
 		typed := false
 		if focused, err := d.findFocused(); err == nil && focused != nil {
-			if err := focused.Input(text); err == nil {
+			if _, isNative := focused.(*NativeElement); isNative {
+				if err := d.typeNative(text); err == nil {
+					typed = true
+				}
+			} else if err := focused.Input(text); err == nil {
 				typed = true
 			}
 		}
 		if !typed {
-			if err := d.client.SendKeyActions(text); err != nil {
+			if err := d.typeNative(text); err != nil {
 				return errorResult(err, fmt.Sprintf("Failed to input text: %v", err))
 			}
 		}
@@ -619,6 +693,28 @@ func (d *Driver) eraseText(step *flow.EraseTextStep) *core.CommandResult {
 	// Try using Element interface (supports both web and native)
 	focused, err := d.findFocused()
 	if err == nil {
+		// NATIVE: erase with DELETE keys, never focused.Clear(). Clear() is the same
+		// ACTION_SET_TEXT primitive typeNative exists to avoid — it is discarded by a
+		// controlled React Native TextInput, and on this app it already failed outright
+		// ("Failed to set text on element: e5") on 2 of 6 fields in the recorded run.
+		// Delete keys go through the IME pipeline, which is what such a field listens to.
+		// Bounded by the CURRENT length so an empty field costs nothing and a short one
+		// does not pay for all 50 of the default.
+		if _, isNative := focused.(*NativeElement); isNative {
+			presses := chars
+			if cur, textErr := focused.Text(); textErr == nil {
+				if l := len([]rune(cur)); l < presses {
+					presses = l
+				}
+			}
+			for i := 0; i < presses; i++ {
+				if err := d.client.PressKeyCode(uiautomator2.KeyCodeDelete); err != nil {
+					return errorResult(err, fmt.Sprintf("Failed to erase text: %v", err))
+				}
+			}
+			return successResult(fmt.Sprintf("Erased %d characters", presses), nil)
+		}
+
 		currentText, textErr := focused.Text()
 		if textErr == nil {
 			textLen := len([]rune(currentText))

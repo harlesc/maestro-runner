@@ -13,8 +13,9 @@ type Element struct {
 	// Cached data — when set, methods return these without HTTP calls.
 	// Used by the Maestro WebSocket adapter to pre-populate element data
 	// from a single round-trip, avoiding extra HTTP calls for text/rect.
-	cachedText *string
-	cachedRect *ElementRect
+	cachedText  *string
+	cachedRect  *ElementRect
+	cachedClass *string
 
 	// Action callbacks — when set, used instead of HTTP calls.
 	// Used by the Maestro WebSocket adapter to route actions through WebSocket.
@@ -32,6 +33,21 @@ func NewCachedElement(id string, text string, rect ElementRect) *Element {
 		cachedText: &text,
 		cachedRect: &rect,
 	}
+}
+
+// SetCachedClass records the element's class name from a round-trip that already carried it, so a
+// caller can discriminate on it without a second call. The RPC has always returned className; only
+// the cached constructor dropped it.
+func (e *Element) SetCachedClass(name string) { e.cachedClass = &name }
+
+// CachedClass returns the class name if one was pre-populated, and ok=false if not. It never makes
+// a call: the one caller is on the hot input path and a wrong answer there is better spent falling
+// back than paying a round trip per keystroke.
+func (e *Element) CachedClass() (string, bool) {
+	if e.cachedClass == nil {
+		return "", false
+	}
+	return *e.cachedClass, true
 }
 
 // SetClickFunc sets the callback for Click().
