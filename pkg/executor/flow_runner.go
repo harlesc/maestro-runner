@@ -57,8 +57,13 @@ func (fr *FlowRunner) Run() FlowResult {
 	// Set parent context on driver so element-finding respects cancellation
 	fr.driver.SetContext(fr.ctx)
 
-	// Import system environment variables
-	fr.script.ImportSystemEnv()
+	// Import system environment variables, unless the caller opted out. See
+	// RunnerConfig.NoImportSystemEnv: an embedding orchestrator's process environment is not the
+	// flow's to read, and every ambient secret in it would otherwise be legible to flow script
+	// expressions.
+	if !fr.config.NoImportSystemEnv {
+		fr.script.ImportSystemEnv()
+	}
 
 	// Apply CLI environment variables (from -e flags)
 	// These take precedence over system env, but flow-level env takes precedence over these

@@ -47,6 +47,20 @@ type RunnerConfig struct {
 	// Environment variables from CLI (-e KEY=VALUE)
 	Env map[string]string
 
+	// NoImportSystemEnv suppresses the import of the host process environment into flow variable
+	// scope. FlowRunner.Run otherwise calls ScriptEngine.ImportSystemEnv() unconditionally, copying
+	// every [A-Z][A-Z0-9_]{2,} process variable into scope before Env is applied over it — so a
+	// flow's script expressions can read any ambient secret the caller happened to export
+	// (API tokens, CI credentials, cloud keys).
+	//
+	// That is fine for a CLI a developer runs by hand, and wrong for a long-lived orchestrator that
+	// holds unrelated credentials in its own environment. Unsetting and restoring os.Environ around
+	// a flow is NOT a safe alternative: it is a data race against every other flow sharing the
+	// process. The only correct fix is to not import in the first place, hence this field.
+	//
+	// Zero value FALSE preserves the historical behaviour, so existing callers are unaffected.
+	NoImportSystemEnv bool
+
 	// Driver settings
 	WaitForIdleTimeout int // Global wait for idle timeout in ms
 	TypingFrequency    int // Global WDA typing frequency in keys/sec (0 = WDA default)
