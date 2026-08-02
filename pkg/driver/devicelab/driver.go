@@ -1488,7 +1488,10 @@ func (d *Driver) resolveRelativeSelector(sel flow.Selector) (*core.ElementInfo, 
 
 	var candidates []*ParsedElement
 	if baseSel.Text != "" || baseSel.ID != "" || baseSel.Width > 0 || baseSel.Height > 0 {
-		candidates = FilterBySelector(allElements, baseSel)
+		// DeepestMatchingPerBranch: Maestro applies deepestMatchingElement to
+		// the basic filters, so container+child double matches leave only the
+		// child. Hierarchy order is preserved.
+		candidates = DeepestMatchingPerBranch(FilterBySelector(allElements, baseSel))
 	} else {
 		candidates = allElements
 	}
@@ -1507,17 +1510,21 @@ func (d *Driver) resolveRelativeSelector(sel flow.Selector) (*core.ElementInfo, 
 				}}
 			}
 		} else {
-			anchors = FilterBySelector(allElements, *anchorSelector)
+			anchors = DeepestMatchingPerBranch(FilterBySelector(allElements, *anchorSelector))
 		}
 	}
 
 	var matchingCandidates []*ParsedElement
 	if len(anchors) > 0 {
-		for _, anchor := range anchors {
-			filtered := applyRelativeFilter(candidates, anchor, filterType)
-			if len(filtered) > 0 {
-				matchingCandidates = filtered
-				break
+		// Maestro's relativeTo keeps a candidate if the predicate holds for
+		// ANY matching anchor (not just the first anchor with results), so
+		// take the union — preserving the candidates' hierarchy order.
+		for _, cand := range candidates {
+			for _, anchor := range anchors {
+				if len(applyRelativeFilter([]*ParsedElement{cand}, anchor, filterType)) > 0 {
+					matchingCandidates = append(matchingCandidates, cand)
+					break
+				}
 			}
 		}
 		candidates = matchingCandidates
@@ -1536,6 +1543,9 @@ func (d *Driver) resolveRelativeSelector(sel flow.Selector) (*core.ElementInfo, 
 	candidates = SortClickableFirst(candidates)
 
 	selected := SelectByIndex(candidates, sel.Index)
+	if selected == nil {
+		return nil, fmt.Errorf("no element at index %q among %d candidates", sel.Index, len(candidates))
+	}
 
 	clickableElem := GetClickableElement(selected)
 
@@ -1565,7 +1575,7 @@ func (d *Driver) findElementRelativeWithElements(sel flow.Selector, allElements 
 
 	var candidates []*ParsedElement
 	if baseSel.Text != "" || baseSel.ID != "" || baseSel.Width > 0 || baseSel.Height > 0 {
-		candidates = FilterBySelector(allElements, baseSel)
+		candidates = DeepestMatchingPerBranch(FilterBySelector(allElements, baseSel))
 	} else {
 		candidates = allElements
 	}
@@ -1584,17 +1594,20 @@ func (d *Driver) findElementRelativeWithElements(sel flow.Selector, allElements 
 				}}
 			}
 		} else {
-			anchors = FilterBySelector(allElements, *anchorSelector)
+			anchors = DeepestMatchingPerBranch(FilterBySelector(allElements, *anchorSelector))
 		}
 	}
 
 	var matchingCandidates []*ParsedElement
 	if len(anchors) > 0 {
-		for _, anchor := range anchors {
-			filtered := applyRelativeFilter(candidates, anchor, filterType)
-			if len(filtered) > 0 {
-				matchingCandidates = filtered
-				break
+		// Union over all anchors, preserving hierarchy order (see
+		// resolveRelativeSelector).
+		for _, cand := range candidates {
+			for _, anchor := range anchors {
+				if len(applyRelativeFilter([]*ParsedElement{cand}, anchor, filterType)) > 0 {
+					matchingCandidates = append(matchingCandidates, cand)
+					break
+				}
 			}
 		}
 		candidates = matchingCandidates
@@ -1613,6 +1626,9 @@ func (d *Driver) findElementRelativeWithElements(sel flow.Selector, allElements 
 	candidates = SortClickableFirst(candidates)
 
 	selected := SelectByIndex(candidates, sel.Index)
+	if selected == nil {
+		return nil, nil, fmt.Errorf("no element at index %q among %d candidates", sel.Index, len(candidates))
+	}
 
 	clickableElem := GetClickableElement(selected)
 
@@ -1642,7 +1658,7 @@ func (d *Driver) findElementByPageSourceOnce(sel flow.Selector) (*uiautomator2.E
 		return nil, nil, fmt.Errorf("failed to parse page source: %w", err)
 	}
 
-	candidates := FilterBySelector(allElements, sel)
+	candidates := DeepestMatchingPerBranch(FilterBySelector(allElements, sel))
 	candidates = SortClickableFirst(candidates)
 
 	if len(candidates) == 0 {
@@ -1650,6 +1666,9 @@ func (d *Driver) findElementByPageSourceOnce(sel flow.Selector) (*uiautomator2.E
 	}
 
 	selected := SelectByIndex(candidates, sel.Index)
+	if selected == nil {
+		return nil, nil, fmt.Errorf("no element at index %q among %d candidates", sel.Index, len(candidates))
+	}
 
 	clickableElem := GetClickableElement(selected)
 
@@ -1700,7 +1719,7 @@ func (d *Driver) findElementByPageSourceOnceInternal(sel flow.Selector) (*core.E
 		return nil, fmt.Errorf("failed to parse page source: %w", err)
 	}
 
-	candidates := FilterBySelector(allElements, sel)
+	candidates := DeepestMatchingPerBranch(FilterBySelector(allElements, sel))
 	candidates = SortClickableFirst(candidates)
 
 	if len(candidates) == 0 {
@@ -1708,6 +1727,9 @@ func (d *Driver) findElementByPageSourceOnceInternal(sel flow.Selector) (*core.E
 	}
 
 	selected := SelectByIndex(candidates, sel.Index)
+	if selected == nil {
+		return nil, fmt.Errorf("no element at index %q among %d candidates", sel.Index, len(candidates))
+	}
 
 	clickableElem := GetClickableElement(selected)
 

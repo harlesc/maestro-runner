@@ -113,17 +113,18 @@ func TestFilterBelow(t *testing.T) {
 	anchor := makeElement(0, 100, 50, 50, 0) // bottom = 150
 	elements := []*ParsedElement{
 		makeElement(0, 50, 10, 10, 0),   // above anchor
-		makeElement(0, 150, 10, 10, 0),  // flush at anchor bottom — below
 		makeElement(0, 200, 10, 10, 0),  // further below
+		makeElement(0, 150, 10, 10, 0),  // flush at anchor bottom — below
 		makeElement(0, 130, 10, 10, 0),  // overlaps anchor — not strictly below
 	}
 	got := FilterBelow(elements, anchor)
 	if len(got) != 2 {
 		t.Fatalf("expected 2 elements below, got %d", len(got))
 	}
-	// Sorted by Y ascending (closest first).
-	if got[0].Bounds.Y != 150 {
-		t.Errorf("expected closest element first (Y=150), got %d", got[0].Bounds.Y)
+	// Maestro parity: predicate only, input (hierarchy) order preserved —
+	// no distance sort. Input order here is Y=200 before Y=150.
+	if got[0].Bounds.Y != 200 || got[1].Bounds.Y != 150 {
+		t.Errorf("expected input order [200 150], got [%d %d]", got[0].Bounds.Y, got[1].Bounds.Y)
 	}
 }
 
@@ -138,9 +139,9 @@ func TestFilterAbove(t *testing.T) {
 	if len(got) != 2 {
 		t.Fatalf("expected 2 elements above, got %d", len(got))
 	}
-	// Closest first means highest bottom.
-	if got[0].Bounds.Y+got[0].Bounds.Height != 100 {
-		t.Errorf("expected closest (bottom=100) first, got %d", got[0].Bounds.Y+got[0].Bounds.Height)
+	// Input order preserved (no closest-first sort).
+	if got[0].Bounds.Y != 50 || got[1].Bounds.Y != 0 {
+		t.Errorf("expected input order [50 0], got [%d %d]", got[0].Bounds.Y, got[1].Bounds.Y)
 	}
 }
 
@@ -155,24 +156,26 @@ func TestFilterLeftOf(t *testing.T) {
 	if len(got) != 2 {
 		t.Fatalf("expected 2 elements left of anchor, got %d", len(got))
 	}
-	if got[0].Bounds.X+got[0].Bounds.Width != 100 {
-		t.Errorf("closest right edge should be 100, got %d", got[0].Bounds.X+got[0].Bounds.Width)
+	// Input order preserved (no closest-first sort): X=0 stays before X=60.
+	if got[0].Bounds.X != 0 || got[1].Bounds.X != 60 {
+		t.Errorf("expected input order [0 60], got [%d %d]", got[0].Bounds.X, got[1].Bounds.X)
 	}
 }
 
 func TestFilterRightOf(t *testing.T) {
 	anchor := makeElement(100, 0, 50, 10, 0) // right = 150
 	elements := []*ParsedElement{
-		makeElement(150, 0, 10, 10, 0),
 		makeElement(200, 0, 10, 10, 0),
+		makeElement(150, 0, 10, 10, 0),
 		makeElement(50, 0, 10, 10, 0), // left of
 	}
 	got := FilterRightOf(elements, anchor)
 	if len(got) != 2 {
 		t.Fatalf("expected 2 elements right of anchor, got %d", len(got))
 	}
-	if got[0].Bounds.X != 150 {
-		t.Errorf("closest left edge should be 150, got %d", got[0].Bounds.X)
+	// Input order preserved (no closest-first sort): X=200 stays before X=150.
+	if got[0].Bounds.X != 200 || got[1].Bounds.X != 150 {
+		t.Errorf("expected input order [200 150], got [%d %d]", got[0].Bounds.X, got[1].Bounds.X)
 	}
 }
 
@@ -260,66 +263,6 @@ func TestContainsAllDescendants(t *testing.T) {
 	}
 	if containsAllDescendants(parent, allElems, descMissing) {
 		t.Error("parent missing 'DoesNotExist' should return false")
-	}
-}
-
-// =============================================================================
-// Sort helpers (table-driven)
-// =============================================================================
-
-func TestSortByDistanceY(t *testing.T) {
-	elems := []*ParsedElement{
-		makeElement(0, 200, 10, 10, 0),
-		makeElement(0, 50, 10, 10, 0),
-		makeElement(0, 100, 10, 10, 0),
-	}
-	sortByDistanceY(elems, 50)
-	wantOrder := []int{50, 100, 200}
-	for i, w := range wantOrder {
-		if elems[i].Bounds.Y != w {
-			t.Errorf("sortByDistanceY[%d].Y = %d, want %d", i, elems[i].Bounds.Y, w)
-		}
-	}
-}
-
-func TestSortByDistanceYReverse(t *testing.T) {
-	// Reverse: sort by (refY - elem.Bottom), closest-to-anchor first means
-	// highest bottom first (i.e. element nearest above the anchor).
-	elems := []*ParsedElement{
-		makeElement(0, 0, 10, 50, 0),   // bottom = 50
-		makeElement(0, 0, 10, 90, 0),   // bottom = 90 — closest
-		makeElement(0, 0, 10, 10, 0),   // bottom = 10 — farthest
-	}
-	sortByDistanceYReverse(elems, 100)
-	if elems[0].Bounds.Height != 90 {
-		t.Errorf("closest bottom should be 90, got %d", elems[0].Bounds.Height)
-	}
-}
-
-func TestSortByDistanceX(t *testing.T) {
-	elems := []*ParsedElement{
-		makeElement(200, 0, 10, 10, 0),
-		makeElement(50, 0, 10, 10, 0),
-		makeElement(100, 0, 10, 10, 0),
-	}
-	sortByDistanceX(elems, 50)
-	wantOrder := []int{50, 100, 200}
-	for i, w := range wantOrder {
-		if elems[i].Bounds.X != w {
-			t.Errorf("sortByDistanceX[%d].X = %d, want %d", i, elems[i].Bounds.X, w)
-		}
-	}
-}
-
-func TestSortByDistanceXReverse(t *testing.T) {
-	elems := []*ParsedElement{
-		makeElement(0, 0, 50, 10, 0),  // right = 50
-		makeElement(0, 0, 90, 10, 0),  // right = 90 — closest to anchorLeft=100
-		makeElement(0, 0, 10, 10, 0),  // right = 10
-	}
-	sortByDistanceXReverse(elems, 100)
-	if elems[0].Bounds.Width != 90 {
-		t.Errorf("closest right=90 should be first, got %d", elems[0].Bounds.Width)
 	}
 }
 
