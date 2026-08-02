@@ -163,10 +163,10 @@ func (m *webViewManager) connectViaUnixSocket(cdpInfo *core.CDPInfo, cdpType str
 
 // cdpTarget represents a Chrome DevTools Protocol target from /json endpoint.
 type cdpTarget struct {
-	ID                 string `json:"id"`
-	Type               string `json:"type"`
-	Title              string `json:"title"`
-	URL                string `json:"url"`
+	ID                   string `json:"id"`
+	Type                 string `json:"type"`
+	Title                string `json:"title"`
+	URL                  string `json:"url"`
 	WebSocketDebuggerURL string `json:"webSocketDebuggerUrl"`
 }
 
@@ -425,6 +425,22 @@ func (m *webViewManager) rodPage() *rod.Page {
 	defer m.mu.RUnlock()
 	return m.page
 }
+
+// webViewManagerIface is the seam of webViewManager the driver depends
+// on. It exists so tests can substitute a fake WebView/DOM (e.g. for
+// tapOn's WebView fallback) without a live CDP connection.
+type webViewManagerIface interface {
+	connect(cdpInfo *core.CDPInfo, cdpType string) error
+	disconnect()
+	isConnected() bool
+	findWebOnce(sel flow.Selector) (core.Element, error)
+	findFocusedWeb() (core.Element, error)
+	rodPage() *rod.Page
+	webViewType() string
+}
+
+// Compile-time check.
+var _ webViewManagerIface = (*webViewManager)(nil)
 
 // webViewType returns "browser", "webview", or "" if not connected.
 func (m *webViewManager) webViewType() string {
@@ -1126,4 +1142,3 @@ func (m *webViewManager) getNetworkTracker() *webViewNetworkTracker {
 	defer m.mu.RUnlock()
 	return m.network
 }
-

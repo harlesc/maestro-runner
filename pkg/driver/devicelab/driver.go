@@ -115,7 +115,7 @@ type Driver struct {
 	cdpStateFunc func() *core.CDPInfo
 
 	// WebView CDP connection manager (nil = not wired)
-	webView       *webViewManager
+	webView       webViewManagerIface
 	lastCDPScan   time.Time     // rate-limit ADB shell CDP scans
 	lastCDPResult *core.CDPInfo // cached result from last scan
 	knownCDPType  string        // "browser" or "webview" — set from socket name, cleared on CDP down

@@ -183,6 +183,32 @@ func (d *Driver) tapOn(step *flow.TapOnStep) *core.CommandResult {
 					}
 					lastErr = err
 				}
+
+				// WebView/DOM fallback: on WebView-hosted screens the native
+				// accessibility tree may not carry the DOM id at all
+				// (verified: a uiautomator dump of a WebView login form shows
+				// resource-id="" on every input, so UiSelector resourceId/
+				// resourceIdMatches can never match `id:` there — the
+				// downstream defect-H error). Native strategies keep
+				// precedence — no behaviour change on native screens, and on
+				// hybrid screens a native match still wins. Only when ALL
+				// native strategies miss and a WebView is connected, resolve
+				// the selector against the DOM and tap through CDP (same
+				// mechanism as tapOnBrowser, which browser mode uses).
+				if d.webView != nil && d.webView.isConnected() {
+					webElem, werr := d.webView.findWebOnce(step.Selector)
+					if werr == nil {
+						if we, ok := webElem.(interface{ Click() error }); ok {
+							logger.Info("[devicelab] tap via CDP for %s (native strategies missed on a WebView screen)",
+								step.Selector.Describe())
+							if clickErr := we.Click(); clickErr != nil {
+								lastErr = fmt.Errorf("CDP tap failed: %w", clickErr)
+							} else {
+								return successResult("Tapped on element", webElem.Info())
+							}
+						}
+					}
+				}
 			}
 		}
 	}
