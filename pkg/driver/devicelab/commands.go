@@ -163,7 +163,19 @@ func (d *Driver) tapOn(step *flow.TapOnStep) *core.CommandResult {
 								logger.Info("[devicelab] tap rejected (off-screen/malformed rect) for %s: w=%d h=%d center=(%d,%d) screen=%dx%d — re-polling",
 									step.Selector.Describe(), info.Bounds.Width, info.Bounds.Height,
 									info.Bounds.X+info.Bounds.Width/2, info.Bounds.Y+info.Bounds.Height/2, sw, sh)
-								lastErr = fmt.Errorf("element rect not tappable (w=%d h=%d center=(%d,%d) screen=%dx%d)",
+								// NAME THE SELECTOR AND THE STRATEGY IN THE ERROR, not just the rect.
+								// This guard refuses a matched node WITHOUT issuing an RPC, so client.log
+								// never names it, and the driver log that would is off whenever flows run
+								// concurrently — leaving the rect as the ONLY evidence. A triager then has
+								// a geometry with no idea which step's target it was, and for a step inside
+								// a runFlow the parent report does not record the nested command either.
+								// The error message is the one channel that survives all of that, because
+								// it reaches junit-report.xml on every run including a full pass.
+								lastErr = fmt.Errorf("element rect not tappable for %s (matched via %s=%s): "+
+									"bounds=[%d,%d][%d,%d] w=%d h=%d center=(%d,%d) screen=%dx%d",
+									step.Selector.Describe(), s.Strategy, s.Value,
+									info.Bounds.X, info.Bounds.Y,
+									info.Bounds.X+info.Bounds.Width, info.Bounds.Y+info.Bounds.Height,
 									info.Bounds.Width, info.Bounds.Height,
 									info.Bounds.X+info.Bounds.Width/2, info.Bounds.Y+info.Bounds.Height/2, sw, sh)
 								time.Sleep(50 * time.Millisecond)
