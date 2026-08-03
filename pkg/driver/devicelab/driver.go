@@ -1388,24 +1388,94 @@ const (
 
 // getRelativeFilter returns the anchor selector and filter type from a selector
 func getRelativeFilter(sel flow.Selector) (*flow.Selector, relativeFilterType) {
-	switch {
-	case sel.Below != nil:
-		return sel.Below, filterBelow
-	case sel.Above != nil:
-		return sel.Above, filterAbove
-	case sel.LeftOf != nil:
-		return sel.LeftOf, filterLeftOf
-	case sel.RightOf != nil:
-		return sel.RightOf, filterRightOf
-	case sel.ChildOf != nil:
-		return sel.ChildOf, filterChildOf
-	case sel.ContainsChild != nil:
-		return sel.ContainsChild, filterContainsChild
-	case sel.InsideOf != nil:
-		return sel.InsideOf, filterInsideOf
-	default:
-		return nil, filterNone
+	if specs := getRelativeFilters(sel); len(specs) > 0 {
+		return specs[0].anchor, specs[0].kind
 	}
+	return nil, filterNone
+}
+
+// relativeSpec is ONE relative constraint on a selector — an anchor plus the direction.
+type relativeSpec struct {
+	anchor *flow.Selector
+	kind   relativeFilterType
+}
+
+// getRelativeFilters returns EVERY relative constraint on the selector.
+//
+// THIS USED TO BE A `switch` RETURNING ONE, first match wins, and that silently discarded the rest.
+// A selector written `{text: X, below: A, above: B}` — the two-sided BRACKET that is the only way to
+// name one cell in a repeated row structure — applied `below: A` and threw `above: B` away, with no
+// error anywhere. Maestro appends all of them (Orchestra.buildFilter: `relativeFilters += ...` per
+// clause) and intersects, so a bracket works there and half-works here.
+//
+// INCIDENT (tk 200mrb-rhqc). Measured on an SRM race card, 4 entrants each with its own Win/Top 2..6
+// cells. The flow taps `{text: "Top 4", below: <runner N>, above: <runner N+1>}` twice, once per
+// runner. With only `below:` applied, BOTH taps resolved to the SAME node — entrant 1's cell, which
+// renders BELOW entrants 2 and 3 while sitting FIRST in the tree, so it satisfies `below:` for both
+// anchors and wins on hierarchy order. Both taps reported PASS; the second undid the first; the flow
+// failed later on "Add to Betslip", which only appears once two runners are selected. Two green taps
+// that net to nothing — this engine's signature failure shape.
+//
+// Order here is irrelevant to the result (the specs are intersected) but is kept as Maestro's.
+func getRelativeFilters(sel flow.Selector) []relativeSpec {
+	var specs []relativeSpec
+	add := func(a *flow.Selector, k relativeFilterType) {
+		if a != nil {
+			specs = append(specs, relativeSpec{anchor: a, kind: k})
+		}
+	}
+	add(sel.Below, filterBelow)
+	add(sel.Above, filterAbove)
+	add(sel.LeftOf, filterLeftOf)
+	add(sel.RightOf, filterRightOf)
+	add(sel.ChildOf, filterChildOf)
+	add(sel.ContainsChild, filterContainsChild)
+	add(sel.InsideOf, filterInsideOf)
+	return specs
+}
+
+// resolveAnchors resolves one relative constraint's anchor selector to candidate anchor elements.
+// An anchor may itself be relative, in which case it resolves recursively to a single element.
+func (d *Driver) resolveAnchors(anchorSel flow.Selector, allElements []*ParsedElement) []*ParsedElement {
+	if len(getRelativeFilters(anchorSel)) > 0 {
+		_, info, err := d.findElementRelativeWithElements(anchorSel, allElements)
+		if err != nil || info == nil {
+			return nil
+		}
+		return []*ParsedElement{{
+			Text:      info.Text,
+			Bounds:    info.Bounds,
+			Enabled:   info.Enabled,
+			Displayed: info.Visible,
+		}}
+	}
+	return DeepestMatchingPerBranch(FilterBySelector(allElements, anchorSel))
+}
+
+// narrowByRelativeFilters applies EVERY relative constraint on sel, intersecting them.
+//
+// Each constraint narrows the surviving set; within one constraint a candidate is kept if the
+// predicate holds for ANY of that constraint's matching anchors (Maestro's relativeTo semantics).
+// Candidate HIERARCHY ORDER is preserved throughout — relative filters are pure predicates and
+// first-wins downstream depends on that order (see the Position filter functions in pagesource.go).
+func (d *Driver) narrowByRelativeFilters(sel flow.Selector, candidates, allElements []*ParsedElement) ([]*ParsedElement, error) {
+	for _, spec := range getRelativeFilters(sel) {
+		anchors := d.resolveAnchors(*spec.anchor, allElements)
+		if len(anchors) == 0 {
+			return nil, fmt.Errorf("anchor element not found")
+		}
+		var kept []*ParsedElement
+		for _, cand := range candidates {
+			for _, anchor := range anchors {
+				if len(applyRelativeFilter([]*ParsedElement{cand}, anchor, spec.kind)) > 0 {
+					kept = append(kept, cand)
+					break
+				}
+			}
+		}
+		candidates = kept
+	}
+	return candidates, nil
 }
 
 // applyRelativeFilter applies the appropriate position filter based on filter type
@@ -1462,7 +1532,6 @@ func (d *Driver) findElementRelativeOnce(sel flow.Selector) (*uiautomator2.Eleme
 
 // resolveRelativeSelector resolves a relative selector with a single page source fetch.
 func (d *Driver) resolveRelativeSelector(sel flow.Selector) (*core.ElementInfo, error) {
-	anchorSelector, filterType := getRelativeFilter(sel)
 
 	baseSel := flow.Selector{
 		Text:      sel.Text,
@@ -1496,41 +1565,13 @@ func (d *Driver) resolveRelativeSelector(sel flow.Selector) (*core.ElementInfo, 
 		candidates = allElements
 	}
 
-	var anchors []*ParsedElement
-	if anchorSelector != nil {
-		_, anchorFilterType := getRelativeFilter(*anchorSelector)
-		if anchorFilterType != filterNone {
-			_, anchorInfo, err := d.findElementRelativeWithElements(*anchorSelector, allElements)
-			if err == nil && anchorInfo != nil {
-				anchors = []*ParsedElement{{
-					Text:      anchorInfo.Text,
-					Bounds:    anchorInfo.Bounds,
-					Enabled:   anchorInfo.Enabled,
-					Displayed: anchorInfo.Visible,
-				}}
-			}
-		} else {
-			anchors = DeepestMatchingPerBranch(FilterBySelector(allElements, *anchorSelector))
-		}
+	// EVERY relative constraint is applied, not just the first — a `below:`+`above:` bracket is one
+	// selector with two constraints and dropping either silently selects the wrong element.
+	narrowed, err := d.narrowByRelativeFilters(sel, candidates, allElements)
+	if err != nil {
+		return nil, err
 	}
-
-	var matchingCandidates []*ParsedElement
-	if len(anchors) > 0 {
-		// Maestro's relativeTo keeps a candidate if the predicate holds for
-		// ANY matching anchor (not just the first anchor with results), so
-		// take the union — preserving the candidates' hierarchy order.
-		for _, cand := range candidates {
-			for _, anchor := range anchors {
-				if len(applyRelativeFilter([]*ParsedElement{cand}, anchor, filterType)) > 0 {
-					matchingCandidates = append(matchingCandidates, cand)
-					break
-				}
-			}
-		}
-		candidates = matchingCandidates
-	} else if anchorSelector != nil {
-		return nil, fmt.Errorf("anchor element not found")
-	}
+	candidates = narrowed
 
 	if len(sel.ContainsDescendants) > 0 {
 		candidates = FilterContainsDescendants(candidates, allElements, sel.ContainsDescendants)
@@ -1559,7 +1600,6 @@ func (d *Driver) resolveRelativeSelector(sel flow.Selector) (*core.ElementInfo, 
 
 // findElementRelativeWithElements resolves a relative selector using pre-parsed elements.
 func (d *Driver) findElementRelativeWithElements(sel flow.Selector, allElements []*ParsedElement) (*uiautomator2.Element, *core.ElementInfo, error) {
-	anchorSelector, filterType := getRelativeFilter(sel)
 
 	baseSel := flow.Selector{
 		Text:      sel.Text,
@@ -1580,40 +1620,12 @@ func (d *Driver) findElementRelativeWithElements(sel flow.Selector, allElements 
 		candidates = allElements
 	}
 
-	var anchors []*ParsedElement
-	if anchorSelector != nil {
-		_, anchorFilterType := getRelativeFilter(*anchorSelector)
-		if anchorFilterType != filterNone {
-			_, anchorInfo, err := d.findElementRelativeWithElements(*anchorSelector, allElements)
-			if err == nil && anchorInfo != nil {
-				anchors = []*ParsedElement{{
-					Text:      anchorInfo.Text,
-					Bounds:    anchorInfo.Bounds,
-					Enabled:   anchorInfo.Enabled,
-					Displayed: anchorInfo.Visible,
-				}}
-			}
-		} else {
-			anchors = DeepestMatchingPerBranch(FilterBySelector(allElements, *anchorSelector))
-		}
+	// EVERY relative constraint, intersected — see resolveRelativeSelector.
+	narrowed, err := d.narrowByRelativeFilters(sel, candidates, allElements)
+	if err != nil {
+		return nil, nil, err
 	}
-
-	var matchingCandidates []*ParsedElement
-	if len(anchors) > 0 {
-		// Union over all anchors, preserving hierarchy order (see
-		// resolveRelativeSelector).
-		for _, cand := range candidates {
-			for _, anchor := range anchors {
-				if len(applyRelativeFilter([]*ParsedElement{cand}, anchor, filterType)) > 0 {
-					matchingCandidates = append(matchingCandidates, cand)
-					break
-				}
-			}
-		}
-		candidates = matchingCandidates
-	} else if anchorSelector != nil {
-		return nil, nil, fmt.Errorf("anchor element not found")
-	}
+	candidates = narrowed
 
 	if len(sel.ContainsDescendants) > 0 {
 		candidates = FilterContainsDescendants(candidates, allElements, sel.ContainsDescendants)

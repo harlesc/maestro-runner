@@ -158,9 +158,10 @@ func TestSwipeCoordsNeverParsesAbsoluteAsPercentage(t *testing.T) {
 			// start and end are the same point here, so both halves must appear as authored.
 			strconv.Itoa(x), strconv.Itoa(y), strconv.Itoa(x), strconv.Itoa(y),
 		}
+		// `input swipe X1 Y1 X2 Y2 DURATION` — seven tokens.
 		got := strings.Fields(sh.commands[0])
-		if len(got) != 6 {
-			t.Fatalf("unexpected argv shape: %q", sh.commands[0])
+		if len(got) != 7 {
+			t.Fatalf("unexpected argv shape (%d tokens): %q", len(got), sh.commands[0])
 		}
 		for i, w := range want {
 			if got[i+2] != w {
