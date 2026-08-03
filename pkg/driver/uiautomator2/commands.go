@@ -761,23 +761,20 @@ func (d *Driver) swipeWithCoordinates(start, end string, durationMs int) *core.C
 		return errorResult(err, fmt.Sprintf("Failed to get screen size: %v", err))
 	}
 
-	// Parse start coordinates
-	startXPct, startYPct, err := parsePercentageCoords(start)
+	// swipe: start/end accept EITHER absolute pixels OR percentages; parsing both as
+	// percentages injects an absolute pair off-screen and `input swipe` exits 0, so the
+	// step reports PASS having moved nothing. See the devicelab driver for the full
+	// incident note (tk 200mrb-urvl). ParsePointCoords honours both forms and
+	// bounds-checks the absolute one.
+	startX, startY, err := core.ParsePointCoords(start, width, height)
 	if err != nil {
 		return errorResult(err, fmt.Sprintf("Invalid start coordinates: %v", err))
 	}
 
-	// Parse end coordinates
-	endXPct, endYPct, err := parsePercentageCoords(end)
+	endX, endY, err := core.ParsePointCoords(end, width, height)
 	if err != nil {
 		return errorResult(err, fmt.Sprintf("Invalid end coordinates: %v", err))
 	}
-
-	// Convert percentages to pixels
-	startX := int(float64(width) * startXPct)
-	startY := int(float64(height) * startYPct)
-	endX := int(float64(width) * endXPct)
-	endY := int(float64(height) * endYPct)
 
 	return d.swipeWithAbsoluteCoords(startX, startY, endX, endY, durationMs)
 }
