@@ -171,13 +171,7 @@ func (d *Driver) tapOn(step *flow.TapOnStep) *core.CommandResult {
 								// a runFlow the parent report does not record the nested command either.
 								// The error message is the one channel that survives all of that, because
 								// it reaches junit-report.xml on every run including a full pass.
-								lastErr = fmt.Errorf("element rect not tappable for %s (matched via %s=%s): "+
-									"bounds=[%d,%d][%d,%d] w=%d h=%d center=(%d,%d) screen=%dx%d",
-									step.Selector.Describe(), s.Strategy, s.Value,
-									info.Bounds.X, info.Bounds.Y,
-									info.Bounds.X+info.Bounds.Width, info.Bounds.Y+info.Bounds.Height,
-									info.Bounds.Width, info.Bounds.Height,
-									info.Bounds.X+info.Bounds.Width/2, info.Bounds.Y+info.Bounds.Height/2, sw, sh)
+								lastErr = notTappableError(step.Selector.Describe(), s.Strategy, s.Value, info.Bounds, sw, sh)
 								time.Sleep(50 * time.Millisecond)
 								break
 							}
@@ -280,6 +274,28 @@ func (d *Driver) tapOn(step *flow.TapOnStep) *core.CommandResult {
 	}
 
 	return successResult("Tapped on element", info)
+}
+
+// notTappableError builds the refusal the isElementOnScreen guard returns, NAMING THE SELECTOR AND
+// THE STRATEGY that matched — not just the geometry.
+//
+// This guard refuses a matched node WITHOUT issuing a driver RPC, so the client log never names what
+// was refused, and the driver diagnostic log is unavailable whenever flows run concurrently. That
+// used to leave the rect as the only evidence: a triager gets `w=250 h=-578 center=(408,2563)` with
+// no way to tell which step's target it was — and for a step inside a runFlow the parent report does
+// not record the nested command either, so the selector was genuinely unrecoverable.
+//
+// The error message is the ONE diagnostic channel that survives all of that: it reaches
+// junit-report.xml on every run, including a full concurrent pass. The raw bounds are included as
+// well as the derived w/h because the raw rect is what shows the clipping shape — a laid-out top
+// below the fold with the bottom clamped to its container (top>bottom).
+func notTappableError(selector, strategy, value string, b core.Bounds, screenW, screenH int) error {
+	return fmt.Errorf("element rect not tappable for %s (matched via %s=%s): "+
+		"bounds=[%d,%d][%d,%d] w=%d h=%d center=(%d,%d) screen=%dx%d",
+		selector, strategy, value,
+		b.X, b.Y, b.X+b.Width, b.Y+b.Height,
+		b.Width, b.Height,
+		b.X+b.Width/2, b.Y+b.Height/2, screenW, screenH)
 }
 
 // boundsTappable reports whether b is a real on-screen rectangle whose centre
@@ -1492,17 +1508,27 @@ func (d *Driver) swipeWithCoordinates(start, end string, durationMs int) *core.C
 	// INCIDENT: tk 200mrb-urvl. Measured on emulator-5556: `swipe start 540,1145
 	// end 540,895` moved content 0px and reported PASS; the same gesture anchored on
 	// its container moved 159px.
-	startX, startY, err := core.ParsePointCoords(start, width, height)
+	startX, startY, err := parseSwipeEndpoint(start, width, height)
 	if err != nil {
 		return errorResult(err, fmt.Sprintf("Invalid start coordinates: %v", err))
 	}
 
-	endX, endY, err := core.ParsePointCoords(end, width, height)
+	endX, endY, err := parseSwipeEndpoint(end, width, height)
 	if err != nil {
 		return errorResult(err, fmt.Sprintf("Invalid end coordinates: %v", err))
 	}
 
 	return d.swipeWithAbsoluteCoords(startX, startY, endX, endY, durationMs)
+}
+
+// parseSwipeEndpoint resolves one `swipe: start:`/`end:` endpoint to absolute pixels, honouring
+// Maestro's contract: EITHER "540,1145" pixels OR "50%,45%" percentages.
+//
+// It exists as a named function rather than two inline calls for two reasons: the same rule applies
+// to both endpoints, and it is the identifier that proves this fix is present in a vendored tree
+// (core.ParsePointCoords alone would not — tapOn: point: has always used it).
+func parseSwipeEndpoint(coord string, screenW, screenH int) (int, int, error) {
+	return core.ParsePointCoords(coord, screenW, screenH)
 }
 
 func (d *Driver) swipeWithAbsoluteCoords(startX, startY, endX, endY, durationMs int) *core.CommandResult {

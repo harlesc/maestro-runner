@@ -169,4 +169,3 @@ func TestSwipeCoordsNeverParsesAbsoluteAsPercentage(t *testing.T) {
 		}
 	}
 }
-
