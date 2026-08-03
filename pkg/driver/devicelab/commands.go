@@ -1458,20 +1458,37 @@ func (d *Driver) swipeWithCoordinates(start, end string, durationMs int) *core.C
 		return errorResult(err, fmt.Sprintf("Failed to get screen size: %v", err))
 	}
 
-	startXPct, startYPct, err := core.ParsePercentageCoords(start)
+	// Maestro's swipe contract (api-reference/commands-available/swipe.md) accepts
+	// EITHER absolute pixels ("540,1145") OR percentages ("50%,45%") for start/end.
+	// This used to call ParsePercentageCoords for BOTH, with no '%' check, so an
+	// absolute pair was scaled as if it were a percentage: "540,1145" became
+	// 540%/1145% of 1080x2340 -> `input swipe 5832 26793 5832 20943`. `adb shell
+	// input swipe` EXITS 0 for off-screen coordinates, so the step reported PASS
+	// having moved 0px — the worst failure shape available, because nothing anywhere
+	// says it failed and the flow fails later on a "missing" element.
+	//
+	// ParsePointCoords detects '%' and, for the absolute form, bounds-checks against
+	// the screen, so an off-screen coordinate is now a LOUD error instead of a silent
+	// no-op. That is the more important half of the fix.
+	//
+	// The screen size passed here is screenSize() — the device-reported USABLE size,
+	// exactly the denominator this function used before — so every percentage swipe
+	// keeps its precise geometry. Do NOT "improve" this to the full physical display:
+	// that shifts every existing percentage swipe (on a 1080x2204/2340 device, 45%
+	// moves 61px) and the flows that use the form are green today.
+	//
+	// INCIDENT: tk 200mrb-urvl. Measured on emulator-5556: `swipe start 540,1145
+	// end 540,895` moved content 0px and reported PASS; the same gesture anchored on
+	// its container moved 159px.
+	startX, startY, err := core.ParsePointCoords(start, width, height)
 	if err != nil {
 		return errorResult(err, fmt.Sprintf("Invalid start coordinates: %v", err))
 	}
 
-	endXPct, endYPct, err := core.ParsePercentageCoords(end)
+	endX, endY, err := core.ParsePointCoords(end, width, height)
 	if err != nil {
 		return errorResult(err, fmt.Sprintf("Invalid end coordinates: %v", err))
 	}
-
-	startX := int(float64(width) * startXPct)
-	startY := int(float64(height) * startYPct)
-	endX := int(float64(width) * endXPct)
-	endY := int(float64(height) * endYPct)
 
 	return d.swipeWithAbsoluteCoords(startX, startY, endX, endY, durationMs)
 }

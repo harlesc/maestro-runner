@@ -159,19 +159,17 @@ func (d *Driver) swipe(step *flow.SwipeStep) *core.CommandResult {
 
 	// Coordinate-based swipe
 	if step.Start != "" && step.End != "" {
-		startXPct, startYPct, err := parsePercentageCoords(step.Start)
+		// start/end accept EITHER absolute pixels OR percentages; parsing both as
+		// percentages injects an absolute pair off-screen while the step still reports
+		// success. See the devicelab driver for the full incident note (tk 200mrb-urvl).
+		startX, startY, err := core.ParsePointCoords(step.Start, w, h)
 		if err != nil {
 			return errorResult(err, "Invalid start coordinates")
 		}
-		endXPct, endYPct, err := parsePercentageCoords(step.End)
+		endX, endY, err := core.ParsePointCoords(step.End, w, h)
 		if err != nil {
 			return errorResult(err, "Invalid end coordinates")
 		}
-
-		startX := int(float64(w) * startXPct)
-		startY := int(float64(h) * startYPct)
-		endX := int(float64(w) * endXPct)
-		endY := int(float64(h) * endYPct)
 
 		duration := step.Duration
 		if duration <= 0 {
